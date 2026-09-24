@@ -105,7 +105,7 @@ IN_PROGRESS = Gauge("inprogress_requests", "help", multiprocess_mode='livesum')
 
 ## API Reference
 
-### `MultiProcessCollector(registry, path=None)`
+### `MultiProcessCollector(registry, path=None, strict=True, max_read_retries=2)`
 
 Collector that aggregates metrics written by all processes in the multiprocess directory.
 
@@ -113,6 +113,8 @@ Collector that aggregates metrics written by all processes in the multiprocess d
 |-----------|------|---------|-------------|
 | `registry` | `CollectorRegistry` | required | Registry to register with. Pass a registry created inside the request context to avoid duplicate metrics. |
 | `path` | `Optional[str]` | `None` | Path to the directory containing the per-process metric files. Defaults to the `PROMETHEUS_MULTIPROC_DIR` environment variable. |
+| `strict` | `bool` | `True` | If `True`, an unreadable metric file fails the whole collection. If `False`, files that are corrupted or still being initialized are skipped instead, with the reason logged at WARNING level. |
+| `max_read_retries` | `int` | `2` | In non-strict mode, how many times a file that still appears to be initializing is re-read before it is skipped. |
 
 Raises `ValueError` if `path` is not set or does not point to an existing directory.
 
@@ -129,6 +131,13 @@ To use a custom path instead of the environment variable:
 
 ```python
 collector = multiprocess.MultiProcessCollector(registry, path='/var/run/prom')
+```
+
+To tolerate files that are still being initialized by a freshly started
+process (or that are corrupted) without failing the whole scrape:
+
+```python
+collector = multiprocess.MultiProcessCollector(registry, strict=False)
 ```
 
 ### `mark_process_dead(pid, path=None)`

@@ -1,14 +1,20 @@
 from collections import defaultdict
 import glob
 import json
+import logging
 import os
+import time
 import warnings
 
 from .metrics import Gauge
 from .metrics_core import Metric
-from .mmap_dict import MmapedDict
+from .mmap_dict import (
+    MmapedDict, MmapedDictError, MmapedDictIncompleteError,
+)
 from .samples import Sample
 from .utils import floatToGoString
+
+logger = logging.getLogger(__name__)
 
 try:  # Python3
     FileNotFoundError
@@ -19,7 +25,7 @@ except NameError:  # Python >= 2.5
 class MultiProcessCollector:
     """Collector for files for multi-process mode."""
 
-    def __init__(self, registry, path=None):
+    def __init__(self, registry, path=None, strict=True, max_read_retries=2):
         if path is None:
             # This deprecation warning can go away in a few releases when removing the compatibility
             if 'prometheus_multiproc_dir' in os.environ and 'PROMETHEUS_MULTIPROC_DIR' not in os.environ:
@@ -29,22 +35,46 @@ class MultiProcessCollector:
         if not path or not os.path.isdir(path):
             raise ValueError('env PROMETHEUS_MULTIPROC_DIR is not set or not a directory')
         self._path = path
+        self._strict = strict
+        self._max_read_retries = max_read_retries
         if registry:
             registry.register(self)
 
     @staticmethod
-    def merge(files, accumulate=True):
+    def merge(files, accumulate=True, strict=True, max_read_retries=2):
         """Merge metrics from given mmap files.
 
         By default, histograms are accumulated, as per prometheus wire format.
         But if writing the merged data back to mmap files, use
         accumulate=False to avoid compound accumulation.
+
+        In strict mode (the default) a file that cannot be parsed fails the
+        whole merge. With strict=False, files that are corrupted or still
+        being initialized are skipped instead, with the reason logged.
         """
-        metrics = MultiProcessCollector._read_metrics(files)
+        metrics = MultiProcessCollector._read_metrics(files, strict, max_read_retries)
         return MultiProcessCollector._accumulate_metrics(metrics, accumulate)
 
     @staticmethod
-    def _read_metrics(files):
+    def _read_file_values(f, strict, max_read_retries):
+        """Read all values from a single mmap file.
+
+        Files that appear to still be initializing are re-read a bounded
+        number of times before giving up.
+        """
+        attempts = 1 if strict else max_read_retries + 1
+        for attempt in range(attempts):
+            try:
+                # Materialize the values so that read errors are raised here,
+                # within the retry loop, rather than during later iteration.
+                return list(MmapedDict.read_all_values_from_file(f))
+            except MmapedDictIncompleteError:
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(0.001)
+
+    @staticmethod
+    def _read_metrics(files, strict=True, max_read_retries=2):
         metrics = {}
         key_cache = {}
 
@@ -60,7 +90,7 @@ class MultiProcessCollector:
             parts = os.path.basename(f).split('_')
             typ = parts[0]
             try:
-                file_values = MmapedDict.read_all_values_from_file(f)
+                file_values = MultiProcessCollector._read_file_values(f, strict, max_read_retries)
             except FileNotFoundError:
                 if typ == 'gauge' and parts[1].startswith('live'):
                     # Files for 'live*' gauges can be deleted between the glob of collect
@@ -68,6 +98,11 @@ class MultiProcessCollector:
                     # the file is missing
                     continue
                 raise
+            except MmapedDictError as e:
+                if strict:
+                    raise
+                logger.warning('Skipping file %s during collection: %s', f, e)
+                continue
             for key, value, timestamp, _ in file_values:
                 metric_name, name, labels, labels_key, help_text = _parse_key(key)
 
@@ -168,7 +203,8 @@ class MultiProcessCollector:
 
     def collect(self):
         files = glob.glob(os.path.join(self._path, '*.db'))
-        return self.merge(files, accumulate=True)
+        return self.merge(files, accumulate=True, strict=self._strict,
+                          max_read_retries=self._max_read_retries)
 
 
 _LIVE_GAUGE_MULTIPROCESS_MODES = {m for m in Gauge._MULTIPROC_MODES if m.startswith('live')}

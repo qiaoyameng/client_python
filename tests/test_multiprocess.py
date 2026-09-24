@@ -1,9 +1,11 @@
 import glob
 import os
 import shutil
+import struct
 import tempfile
 import unittest
 import warnings
+from unittest import mock
 
 from prometheus_client import mmap_dict, values
 from prometheus_client.core import (
@@ -660,3 +662,112 @@ class TestUnsetEnv(unittest.TestCase):
 
     def tearDown(self):
         os.remove(self.tmpfl)
+
+
+class TestMultiProcessCollectorTolerantReads(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.mkdtemp()
+        os.environ['PROMETHEUS_MULTIPROC_DIR'] = self.tempdir
+        self.registry = CollectorRegistry(support_collectors_without_names=True)
+        self.collector = MultiProcessCollector(self.registry, strict=False)
+        # A healthy file that must keep being collected no matter what
+        # happens to the other files in the directory.
+        self._write_file('counter_123.db', self._record(
+            mmap_dict.mmap_key('c', 'c_total', [], [], 'help'), 3.0))
+
+    def tearDown(self):
+        del os.environ['PROMETHEUS_MULTIPROC_DIR']
+        shutil.rmtree(self.tempdir)
+
+    def _path(self, name):
+        return os.path.join(self.tempdir, name)
+
+    @staticmethod
+    def _record(key, value, timestamp=0.0):
+        encoded = key.encode('utf-8')
+        padded = encoded + b' ' * (8 - (len(encoded) + 4) % 8)
+        return struct.pack(f'i{len(padded)}sdd'.encode(), len(encoded), padded, value, timestamp)
+
+    def _write_raw(self, name, payload, used=None):
+        if used is None:
+            used = 8 + len(payload)
+        with open(self._path(name), 'wb') as f:
+            f.write(struct.pack('i', used) + b'\0' * 4 + payload)
+
+    def _write_file(self, name, *records):
+        self._write_raw(name, b''.join(records))
+
+    def assert_skipped_with_reason(self, reason):
+        with self.assertLogs('prometheus_client.multiprocess', level='WARNING') as cm:
+            # The healthy file is still collected while the bad one is skipped.
+            self.assertEqual(3.0, self.registry.get_sample_value('c_total'))
+        self.assertIn('counter_456.db', ''.join(cm.output))
+        self.assertIn(reason, ''.join(cm.output))
+
+    def test_file_being_initialized_is_skipped_then_collected(self):
+        path = self._path('counter_456.db')
+        key = mmap_dict.mmap_key('c2', 'c2_total', [], [], 'help')
+
+        # Stage 1: the file was just created, its header is not written yet.
+        open(path, 'wb').close()
+        self.assert_skipped_with_reason('header is incomplete')
+        self.assertIsNone(self.registry.get_sample_value('c2_total'))
+
+        # Stage 2: the file is preallocated, but the header is still zeroed.
+        with open(path, 'wb') as f:
+            f.truncate(mmap_dict._INITIAL_MMAP_SIZE)
+        self.assert_skipped_with_reason('not yet initialized')
+        self.assertIsNone(self.registry.get_sample_value('c2_total'))
+
+        # Stage 3: the file is fully published and gets collected.
+        self._write_file('counter_456.db', self._record(key, 7.0))
+        self.assertEqual(3.0, self.registry.get_sample_value('c_total'))
+        self.assertEqual(7.0, self.registry.get_sample_value('c2_total'))
+
+    def test_negative_record_length_is_skipped(self):
+        self._write_raw('counter_456.db', struct.pack('i', -1))
+        self.assert_skipped_with_reason('Negative record length')
+
+    def test_out_of_bounds_used_is_skipped(self):
+        # A used value between 0 and the 8 byte header is invalid.
+        self._write_raw('counter_456.db', b'', used=4)
+        self.assert_skipped_with_reason('Invalid used value')
+
+    def test_used_beyond_file_size_is_retried_then_skipped(self):
+        # The file claims more data than it contains, like a file that is
+        # still being extended. It is re-read a bounded number of times.
+        self._write_raw('counter_456.db', b'', used=10 ** 6)
+        original = mmap_dict.MmapedDict.read_all_values_from_file
+        reads = []
+
+        def counting_read(filename):
+            reads.append(filename)
+            return original(filename)
+
+        with mock.patch.object(
+                mmap_dict.MmapedDict, 'read_all_values_from_file',
+                side_effect=counting_read):
+            self.assert_skipped_with_reason('still being extended')
+        self.assertEqual(
+            3,  # 1 initial attempt + 2 retries (the default max_read_retries).
+            len([r for r in reads if r.endswith('counter_456.db')]))
+
+    def test_invalid_utf8_key_is_skipped(self):
+        record = struct.pack('i', 2) + b'\xff\xff' + b'  ' + struct.pack('dd', 1.0, 0.0)
+        self._write_raw('counter_456.db', record)
+        self.assert_skipped_with_reason('Invalid UTF-8')
+
+    def test_truncated_double_is_skipped(self):
+        key = mmap_dict.mmap_key('c2', 'c2_total', [], [], 'help')
+        record = self._record(key, 5.0)
+        # Commit only half of the value/timestamp doubles.
+        self._write_raw('counter_456.db', record[:-8])
+        self.assert_skipped_with_reason('Truncated record')
+        # The half-written value must not be counted.
+        self.assertIsNone(self.registry.get_sample_value('c2_total'))
+
+    def test_strict_mode_still_fails(self):
+        registry = CollectorRegistry(support_collectors_without_names=True)
+        collector = MultiProcessCollector(registry, self.tempdir)
+        self._write_raw('counter_456.db', struct.pack('i', -1))
+        self.assertRaises(RuntimeError, collector.collect)
