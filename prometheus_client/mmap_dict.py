@@ -16,12 +16,44 @@ _unpack_two_doubles = struct.Struct(b'dd').unpack_from
 # Using direct assignment solves this issue.
 
 
+class MmapedDictError(Exception):
+    """Base class for errors reading a mmaped dict file."""
+
+
+class IncompleteMmapedFileError(MmapedDictError):
+    """The file looks like it is still being initialized by its writer.
+
+    This is a transient condition: a fresh file is created empty and its
+    header is only written afterwards, so a reader racing with the writer
+    may observe it. Retrying the read after a short delay may succeed.
+    """
+
+
+class CorruptedMmapedFileError(MmapedDictError, RuntimeError):
+    """The file content is structurally invalid and will not heal by retrying.
+
+    Subclasses RuntimeError for backwards compatibility with the error
+    previously raised for corrupted files.
+    """
+
+
 def _pack_two_doubles(data, pos, value, timestamp):
     data[pos:pos + 16] = _pack_two_doubles_func(value, timestamp)
 
 
 def _pack_integer(data, pos, value):
     data[pos:pos + 4] = _pack_integer_func(value)
+
+
+def _check_used(used, available):
+    """Validate the `used` header value against the size of the data read."""
+    if used == 0:
+        # A freshly created file is all zeros until the writer initializes it.
+        raise IncompleteMmapedFileError('file header not yet initialized (used == 0)')
+    if used < 8:
+        raise CorruptedMmapedFileError(f'invalid used value {used}: smaller than the 8 byte header')
+    if used > available:
+        raise CorruptedMmapedFileError(f'used value {used} exceeds file size {available}')
 
 
 def _read_all_values(data, used=0):
@@ -34,17 +66,28 @@ def _read_all_values(data, used=0):
     pos = 8
 
     while pos < used:
+        if pos + 4 > used:
+            raise CorruptedMmapedFileError(f'truncated record length at offset {pos}')
         encoded_len = _unpack_integer(data, pos)[0]
-        # check we are not reading beyond bounds
-        if encoded_len + pos > used:
-            raise RuntimeError('Read beyond file size detected, file is corrupted.')
-        pos += 4
-        encoded_key = data[pos:pos + encoded_len]
+        if encoded_len < 0:
+            raise CorruptedMmapedFileError(f'negative record length {encoded_len} at offset {pos}')
         padded_len = encoded_len + (8 - (encoded_len + 4) % 8)
-        pos += padded_len
-        value, timestamp = _unpack_two_doubles(data, pos)
-        yield encoded_key.decode('utf-8'), value, timestamp, pos
-        pos += 16
+        value_pos = pos + 4 + padded_len
+        if value_pos % 8 != 0:
+            raise CorruptedMmapedFileError(f'misaligned record value at offset {value_pos}')
+        # Check the whole record (key, padding and the two doubles) is
+        # contained in the used region before reading any of it, so a
+        # truncated record can never contribute a partial value.
+        if value_pos + 16 > used:
+            raise CorruptedMmapedFileError(f'truncated record at offset {pos}: extends beyond used {used}')
+        encoded_key = data[pos + 4:pos + 4 + encoded_len]
+        try:
+            key = encoded_key.decode('utf-8')
+        except UnicodeDecodeError as e:
+            raise CorruptedMmapedFileError(f'invalid utf-8 key at offset {pos + 4}') from e
+        value, timestamp = _unpack_two_doubles(data, value_pos)
+        yield key, value, timestamp, value_pos
+        pos = value_pos + 16
 
 
 class MmapedDict:
@@ -87,9 +130,15 @@ class MmapedDict:
             # Read the first block of data, including the first 4 bytes which tell us
             # how much of the file (which is preallocated to _INITIAL_MMAP_SIZE bytes) is occupied.
             data = infp.read(mmap.PAGESIZE)
+            if len(data) < 8:
+                # The file was just created and its header has not been
+                # written yet; this is a transient state.
+                raise IncompleteMmapedFileError(
+                    f'file too short for header: {len(data)} bytes')
             used = _unpack_integer(data, 0)[0]
             if used > len(data):  # Then read in the rest, if needed.
                 data += infp.read(used - len(data))
+            _check_used(used, len(data))
         return _read_all_values(data, used)
 
     def _init_value(self, key):

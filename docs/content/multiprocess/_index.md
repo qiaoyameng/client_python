@@ -105,7 +105,7 @@ IN_PROGRESS = Gauge("inprogress_requests", "help", multiprocess_mode='livesum')
 
 ## API Reference
 
-### `MultiProcessCollector(registry, path=None)`
+### `MultiProcessCollector(registry, path=None, tolerant=False, max_read_retries=3, retry_delay=0.005)`
 
 Collector that aggregates metrics written by all processes in the multiprocess directory.
 
@@ -113,6 +113,9 @@ Collector that aggregates metrics written by all processes in the multiprocess d
 |-----------|------|---------|-------------|
 | `registry` | `CollectorRegistry` | required | Registry to register with. Pass a registry created inside the request context to avoid duplicate metrics. |
 | `path` | `Optional[str]` | `None` | Path to the directory containing the per-process metric files. Defaults to the `PROMETHEUS_MULTIPROC_DIR` environment variable. |
+| `tolerant` | `bool` | `False` | If `True`, files that cannot be read are skipped instead of failing the whole collection: files still being initialized by a writer are re-read up to `max_read_retries` times, and corrupted files are skipped. Skipped files are reported, with reasons, on the collector's `skipped` attribute. If `False` (the default), any unreadable file fails the collection. |
+| `max_read_retries` | `int` | `3` | How many times an incompletely initialized file is re-read before it is skipped. Only used when `tolerant=True`. |
+| `retry_delay` | `float` | `0.005` | Delay in seconds between re-read attempts. Only used when `tolerant=True`. |
 
 Raises `ValueError` if `path` is not set or does not point to an existing directory.
 
@@ -129,6 +132,15 @@ To use a custom path instead of the environment variable:
 
 ```python
 collector = multiprocess.MultiProcessCollector(registry, path='/var/run/prom')
+```
+
+To tolerate files that are concurrently being initialized or corrupted:
+
+```python
+collector = multiprocess.MultiProcessCollector(registry, tolerant=True)
+# After a collection, inspect which files were skipped and why:
+for skipped in collector.skipped:
+    print(skipped.path, skipped.reason)
 ```
 
 ### `mark_process_dead(pid, path=None)`

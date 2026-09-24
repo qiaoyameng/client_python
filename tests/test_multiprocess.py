@@ -1,8 +1,10 @@
 import glob
 import os
 import shutil
+import struct
 import tempfile
 import unittest
+import unittest.mock
 import warnings
 
 from prometheus_client import mmap_dict, values
@@ -602,6 +604,163 @@ class TestMultiProcess(unittest.TestCase):
         self.assertEqual(child.context['namespace'], 'prod')
         self.assertEqual(child.context['subsystem'], 'api')
         self.assertEqual(child.context['unit'], 'seconds')
+
+
+def _record(key_bytes, value=1.0, timestamp=0.0, declared_len=None):
+    """Build a raw mmap file record, as MmapedDict._init_value would."""
+    if declared_len is None:
+        declared_len = len(key_bytes)
+    padded = key_bytes + b' ' * (8 - (len(key_bytes) + 4) % 8)
+    return struct.pack('i', declared_len) + padded + struct.pack('dd', value, timestamp)
+
+
+class TestMultiProcessTolerant(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.mkdtemp()
+        os.environ['PROMETHEUS_MULTIPROC_DIR'] = self.tempdir
+        values.ValueClass = MultiProcessValue(lambda: 123)
+        self.registry = CollectorRegistry(support_collectors_without_names=True)
+        self.collector = MultiProcessCollector(self.registry, tolerant=True)
+        self.strict_registry = CollectorRegistry(support_collectors_without_names=True)
+        self.strict_collector = MultiProcessCollector(self.strict_registry, tolerant=False)
+
+    def tearDown(self):
+        del os.environ['PROMETHEUS_MULTIPROC_DIR']
+        values.close_all_multiprocess_files()
+        values.ValueClass = MutexValue
+        shutil.rmtree(self.tempdir)
+
+    def _write_file(self, name, body=b'', used=None):
+        """Publish a raw mmap file with full control over header and body."""
+        if used is None:
+            used = 8 + len(body)
+        path = os.path.join(self.tempdir, name)
+        with open(path, 'wb') as f:
+            f.write(struct.pack('i', used) + b'\0' * 4 + body)
+        return path
+
+    def _create_empty_file(self, name):
+        """Create a zero byte file, as seen just after a writer created it."""
+        path = os.path.join(self.tempdir, name)
+        open(path, 'wb').close()
+        return path
+
+    def _sample_value(self, metrics, name):
+        for m in metrics:
+            for s in m.samples:
+                if s.name == name:
+                    return s.value
+        return None
+
+    def test_tolerant_skips_file_being_initialized(self):
+        Counter('existing', 'help', registry=None).inc(2)
+        # A writer created the file but has not written the header yet.
+        path = self._create_empty_file('counter_456.db')
+
+        metrics = {m.name: m for m in self.collector.collect()}
+        self.assertEqual(2.0, self._sample_value(metrics.values(), 'existing_total'))
+        self.assertEqual(1, len(self.collector.skipped))
+        self.assertEqual(path, self.collector.skipped[0].path)
+        self.assertIn('header', self.collector.skipped[0].reason)
+
+        # Strict mode keeps the existing failure behavior.
+        self.assertRaises(
+            mmap_dict.IncompleteMmapedFileError, self.strict_collector.collect)
+
+    def test_tolerant_staged_publish(self):
+        Counter('existing', 'help', registry=None).inc(2)
+        key = mmap_dict.mmap_key('staged', 'staged_total', [], [], 'staged help')
+
+        # Stage 1: file created, header not written yet. Other metrics
+        # are still collected and the file is reported as skipped.
+        path = self._create_empty_file('counter_456.db')
+        metrics = {m.name: m for m in self.collector.collect()}
+        self.assertEqual(2.0, self._sample_value(metrics.values(), 'existing_total'))
+        self.assertIsNone(self._sample_value(metrics.values(), 'staged_total'))
+        self.assertEqual([path], [s.path for s in self.collector.skipped])
+
+        # Stage 2: header published, no records yet. The file is valid
+        # and contributes nothing.
+        self._write_file('counter_456.db')
+        metrics = {m.name: m for m in self.collector.collect()}
+        self.assertEqual(2.0, self._sample_value(metrics.values(), 'existing_total'))
+        self.assertIsNone(self._sample_value(metrics.values(), 'staged_total'))
+        self.assertEqual([], self.collector.skipped)
+
+        # Stage 3: record published. The new file is now collected.
+        self._write_file('counter_456.db', _record(key.encode('utf-8'), 7.0))
+        metrics = {m.name: m for m in self.collector.collect()}
+        self.assertEqual(2.0, self._sample_value(metrics.values(), 'existing_total'))
+        self.assertEqual(7.0, self._sample_value(metrics.values(), 'staged_total'))
+        self.assertEqual([], self.collector.skipped)
+
+    def test_tolerant_retries_are_bounded(self):
+        path = self._create_empty_file('counter_456.db')
+        collector = MultiProcessCollector(
+            None, tolerant=True, max_read_retries=2, retry_delay=0)
+        calls = []
+        original = mmap_dict.MmapedDict.read_all_values_from_file
+
+        def counting_read(filename):
+            calls.append(filename)
+            return original(filename)
+
+        with unittest.mock.patch.object(
+                mmap_dict.MmapedDict, 'read_all_values_from_file',
+                staticmethod(counting_read)):
+            metrics = list(collector.collect())
+        self.assertEqual([], metrics)
+        # 1 initial attempt + 2 retries, no unbounded re-reading.
+        self.assertEqual(3, len(calls))
+        self.assertEqual([path], [s.path for s in collector.skipped])
+
+    def _assert_corrupted_file_skipped(self, name, body, used, reason_part):
+        Counter('existing', 'help', registry=None).inc(2)
+        path = self._write_file(name, body, used)
+
+        metrics = {m.name: m for m in self.collector.collect()}
+        # The healthy file is unaffected and the corrupted file
+        # contributes nothing, not even a partial value.
+        self.assertEqual(2.0, self._sample_value(metrics.values(), 'existing_total'))
+        self.assertIsNone(self._sample_value(metrics.values(), 'broken_total'))
+        self.assertEqual(1, len(self.collector.skipped))
+        self.assertEqual(path, self.collector.skipped[0].path)
+        self.assertIn(reason_part, self.collector.skipped[0].reason)
+
+        # Strict mode keeps the existing failure behavior.
+        self.assertRaises(
+            mmap_dict.CorruptedMmapedFileError, self.strict_collector.collect)
+
+    def test_tolerant_negative_record_length(self):
+        key = mmap_dict.mmap_key('broken', 'broken_total', [], [], 'help')
+        body = _record(key.encode('utf-8'), 5.0, declared_len=-1)
+        self._assert_corrupted_file_skipped(
+            'counter_999.db', body, 8 + len(body), 'negative record length')
+
+    def test_tolerant_used_beyond_file_size(self):
+        key = mmap_dict.mmap_key('broken', 'broken_total', [], [], 'help')
+        body = _record(key.encode('utf-8'), 5.0)
+        self._assert_corrupted_file_skipped(
+            'counter_999.db', body, 1 << 20, 'exceeds file size')
+
+    def test_tolerant_used_smaller_than_header(self):
+        key = mmap_dict.mmap_key('broken', 'broken_total', [], [], 'help')
+        body = _record(key.encode('utf-8'), 5.0)
+        self._assert_corrupted_file_skipped(
+            'counter_999.db', body, 4, 'smaller than the 8 byte header')
+
+    def test_tolerant_invalid_utf8_key(self):
+        body = _record(b'\xff\xfe not utf-8', 5.0)
+        self._assert_corrupted_file_skipped(
+            'counter_999.db', body, 8 + len(body), 'invalid utf-8 key')
+
+    def test_tolerant_truncated_double(self):
+        key = mmap_dict.mmap_key('broken', 'broken_total', [], [], 'help')
+        body = _record(key.encode('utf-8'), 5.0)
+        # `used` cuts the record in the middle of the two doubles, so the
+        # value must not be read at all.
+        self._assert_corrupted_file_skipped(
+            'counter_999.db', body, 8 + len(body) - 8, 'truncated record')
 
 
 class TestMmapedDict(unittest.TestCase):
