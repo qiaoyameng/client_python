@@ -5,6 +5,7 @@ from .metrics_core import (
     SummaryMetricFamily, UnknownMetricFamily, UntypedMetricFamily,
 )
 from .registry import CollectorRegistry, DuplicateTimeseries, REGISTRY
+from .registry_view import RegistryView
 from .samples import BucketSpan, Exemplar, NativeHistogram, Sample, Timestamp
 
 __all__ = (
@@ -25,6 +26,7 @@ __all__ = (
     'Metric',
     'NativeHistogram',
     'REGISTRY',
+    'RegistryView',
     'Sample',
     'StateSetMetricFamily',
     'Summary',

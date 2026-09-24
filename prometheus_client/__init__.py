@@ -2,7 +2,7 @@
 
 from . import (
     exposition, gc_collector, metrics, metrics_core, platform_collector,
-    process_collector, registry,
+    process_collector, registry, registry_view,
 )
 from .exposition import (
     CONTENT_TYPE_LATEST, CONTENT_TYPE_PLAIN_0_0_4, CONTENT_TYPE_PLAIN_1_0_0,
@@ -20,10 +20,12 @@ from .metrics_core import Metric
 from .platform_collector import PLATFORM_COLLECTOR, PlatformCollector
 from .process_collector import PROCESS_COLLECTOR, ProcessCollector
 from .registry import CollectorRegistry, REGISTRY
+from .registry_view import RegistryView
 
 __all__ = (
     'CollectorRegistry',
     'REGISTRY',
+    'RegistryView',
     'Metric',
     'Counter',
     'Gauge',
