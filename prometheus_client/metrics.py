@@ -108,6 +108,8 @@ class MetricWrapperBase(Collector):
                  unit: str = '',
                  registry: Optional[CollectorRegistry] = REGISTRY,
                  _labelvalues: Optional[Sequence[str]] = None,
+                 max_labelsets: Optional[int] = None,
+                 overflow_labels: Optional[Dict[str, str]] = None,
                  ) -> None:
 
         self._original_name = name
@@ -116,6 +118,8 @@ class MetricWrapperBase(Collector):
         self._name = _build_full_name(self._type, name, namespace, subsystem, unit)
         self._labelnames = _validate_labelnames(self, labelnames)
         self._labelvalues = tuple(_labelvalues or ())
+        self._max_labelsets, self._overflow_labelvalues = self._validate_overflow_config(
+            max_labelsets, overflow_labels)
         self._kwargs: Dict[str, Any] = {}
         self._documentation = documentation
         self._unit = unit
@@ -134,6 +138,56 @@ class MetricWrapperBase(Collector):
             # Register the multi-wrapper parent metric, or if a label-less metric, the whole shebang.
             if registry:
                 registry.register(self)
+
+    def _validate_overflow_config(self,
+                                  max_labelsets: Optional[int],
+                                  overflow_labels: Optional[Dict[str, str]],
+                                  ) -> Tuple[Optional[int], Optional[Tuple[str, ...]]]:
+        """Validate the optional labelset-limit configuration.
+
+        Returns (max_labelsets, overflow_labelvalues) with the overflow label
+        values in labelname order, or (None, None) when the feature is off.
+        """
+        if max_labelsets is None and overflow_labels is None:
+            return None, None
+        if self._type not in ('counter', 'histogram'):
+            raise ValueError(
+                'max_labelsets and overflow_labels are only supported for Counter and Histogram, '
+                'not %s' % self._type)
+        if values.ValueClass._multiprocess:
+            raise ValueError('max_labelsets and overflow_labels are not supported in multiprocess mode')
+        if max_labelsets is None or overflow_labels is None:
+            raise ValueError('max_labelsets and overflow_labels must be configured together')
+        if not self._labelnames:
+            raise ValueError('max_labelsets requires label names to be set')
+        if isinstance(max_labelsets, bool) or not isinstance(max_labelsets, int) or max_labelsets < 1:
+            raise ValueError('max_labelsets must be a positive integer')
+        if not isinstance(overflow_labels, dict) or set(overflow_labels) != set(self._labelnames):
+            raise ValueError(
+                'overflow_labels must be a dict keyed by exactly the metric label names: %s'
+                % (self._labelnames,))
+        return max_labelsets, tuple(str(overflow_labels[l]) for l in self._labelnames)
+
+    def _create_child(self: T, labelvalues: Sequence[str]) -> T:
+        original_name = getattr(self, '_original_name', self._name)
+        namespace = getattr(self, '_namespace', '')
+        subsystem = getattr(self, '_subsystem', '')
+        unit = getattr(self, '_unit', '')
+
+        child_kwargs = dict(self._kwargs) if self._kwargs else {}
+        for k in ('namespace', 'subsystem', 'unit'):
+            child_kwargs.pop(k, None)
+
+        return self.__class__(
+            original_name,
+            documentation=self._documentation,
+            labelnames=self._labelnames,
+            namespace=namespace,
+            subsystem=subsystem,
+            unit=unit,
+            _labelvalues=labelvalues,
+            **child_kwargs
+        )
 
     def labels(self: T, *labelvalues: object, **labelkwargs: object) -> T:
         """Return the child for the given labelset.
@@ -154,6 +208,12 @@ class MetricWrapperBase(Collector):
             c = Counter('my_requests_total', 'HTTP Failures', ['method', 'endpoint'])
             c.labels(method='get', endpoint='/').inc()
             c.labels(method='post', endpoint='/submit').inc()
+
+        If the metric was constructed with ``max_labelsets`` and
+        ``overflow_labels``, at most ``max_labelsets`` distinct labelsets get
+        their own child. Once that limit is reached, every further labelset
+        maps to the single overflow child identified by ``overflow_labels``.
+        Already admitted labelsets keep their own child and are never evicted.
 
         See the best practices on [naming](http://prometheus.io/docs/practices/naming/)
         and [labels](http://prometheus.io/docs/practices/instrumentation/#use-labels).
@@ -179,28 +239,18 @@ class MetricWrapperBase(Collector):
                 raise ValueError('Incorrect label count')
             str_labelvalues = tuple(str(l) for l in labelvalues)
         with self._lock:
-            if str_labelvalues not in self._metrics:
-
-                original_name = getattr(self, '_original_name', self._name)
-                namespace = getattr(self, '_namespace', '')
-                subsystem = getattr(self, '_subsystem', '')
-                unit = getattr(self, '_unit', '')
-
-                child_kwargs = dict(self._kwargs) if self._kwargs else {}
-                for k in ('namespace', 'subsystem', 'unit'):
-                    child_kwargs.pop(k, None)
-
-                self._metrics[str_labelvalues] = self.__class__(
-                    original_name,
-                    documentation=self._documentation,
-                    labelnames=self._labelnames,
-                    namespace=namespace,
-                    subsystem=subsystem,
-                    unit=unit,
-                    _labelvalues=str_labelvalues,
-                    **child_kwargs
-                )
-            return self._metrics[str_labelvalues]
+            key = str_labelvalues
+            if (key not in self._metrics
+                    and self._overflow_labelvalues is not None
+                    and key != self._overflow_labelvalues):
+                admitted = len(self._metrics)
+                if self._overflow_labelvalues in self._metrics:
+                    admitted -= 1
+                if admitted >= self._max_labelsets:
+                    key = self._overflow_labelvalues
+            if key not in self._metrics:
+                self._metrics[key] = self._create_child(key)
+            return self._metrics[key]
 
     def remove(self, *labelvalues: Any) -> None:
         if 'prometheus_multiproc_dir' in os.environ or 'PROMETHEUS_MULTIPROC_DIR' in os.environ:
@@ -211,7 +261,13 @@ class MetricWrapperBase(Collector):
         if not self._labelnames:
             raise ValueError('No label names were set when constructing %s' % self)
 
-        """Remove the given labelset from the metric."""
+        """Remove the given labelset from the metric.
+
+        When max_labelsets is configured, removing a labelset frees its slot
+        so a new labelset can be admitted afterwards. The overflow labelset
+        may also be removed; it is recreated on the next overflowing
+        observation.
+        """
         if len(labelvalues) != len(self._labelnames):
             raise ValueError('Incorrect label count (expected %d, got %s)' % (len(self._labelnames), labelvalues))
         labelvalues = tuple(str(l) for l in labelvalues)
@@ -253,7 +309,12 @@ class MetricWrapperBase(Collector):
         
 
     def clear(self) -> None:
-        """Remove all labelsets from the metric"""
+        """Remove all labelsets from the metric.
+
+        When max_labelsets is configured, this frees every slot, including
+        the overflow labelset, so up to max_labelsets new labelsets can be
+        admitted afterwards.
+        """
         if not self._labelnames:
             return
         if 'prometheus_multiproc_dir' in os.environ or 'PROMETHEUS_MULTIPROC_DIR' in os.environ:
@@ -325,6 +386,14 @@ class Counter(MetricWrapperBase):
     without restarting the actual python process.
 
        c.reset()
+
+    To bound the number of child series when label values come from an
+    untrusted source, pass max_labelsets together with overflow_labels.
+    Once max_labelsets distinct labelsets exist, observations for any new
+    labelset are aggregated into the single overflow labelset instead:
+
+        c = Counter('my_failures_total', 'Description of counter', ['user'],
+                    max_labelsets=1000, overflow_labels={'user': '__overflow__'})
 
     """
     _type = 'counter'
@@ -420,6 +489,8 @@ class Gauge(MetricWrapperBase):
                  registry: Optional[CollectorRegistry] = REGISTRY,
                  _labelvalues: Optional[Sequence[str]] = None,
                  multiprocess_mode: Literal['all', 'liveall', 'min', 'livemin', 'max', 'livemax', 'sum', 'livesum', 'mostrecent', 'livemostrecent'] = 'all',
+                 max_labelsets: Optional[int] = None,
+                 overflow_labels: Optional[Dict[str, str]] = None,
                  ):
         self._multiprocess_mode = multiprocess_mode
         if multiprocess_mode not in self._MULTIPROC_MODES:
@@ -433,6 +504,8 @@ class Gauge(MetricWrapperBase):
             unit=unit,
             registry=registry,
             _labelvalues=_labelvalues,
+            max_labelsets=max_labelsets,
+            overflow_labels=overflow_labels,
         )
         self._kwargs['multiprocess_mode'] = self._multiprocess_mode
         self._is_most_recent = self._multiprocess_mode in self._MOST_RECENT_MODES
@@ -608,6 +681,10 @@ class Histogram(MetricWrapperBase):
 
     The default buckets are intended to cover a typical web/rpc request from milliseconds to seconds.
     They can be overridden by passing `buckets` keyword argument to `Histogram`.
+
+    Like Counter, Histogram accepts max_labelsets together with
+    overflow_labels to bound the number of child series; excess labelsets
+    are aggregated into the configured overflow labelset.
     """
     _type = 'histogram'
     _reserved_labelnames = ['le']
@@ -623,6 +700,8 @@ class Histogram(MetricWrapperBase):
                  registry: Optional[CollectorRegistry] = REGISTRY,
                  _labelvalues: Optional[Sequence[str]] = None,
                  buckets: Sequence[Union[float, str]] = DEFAULT_BUCKETS,
+                 max_labelsets: Optional[int] = None,
+                 overflow_labels: Optional[Dict[str, str]] = None,
                  ):
         self._prepare_buckets(buckets)
         super().__init__(
@@ -634,6 +713,8 @@ class Histogram(MetricWrapperBase):
             unit=unit,
             registry=registry,
             _labelvalues=_labelvalues,
+            max_labelsets=max_labelsets,
+            overflow_labels=overflow_labels,
         )
         self._kwargs['buckets'] = buckets
 

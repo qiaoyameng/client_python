@@ -757,6 +757,169 @@ class TestMetricWrapper(unittest.TestCase):
         self.assertEqual(c._name, 'b_total')
 
 
+class TestLabelsetLimit(unittest.TestCase):
+    def setUp(self):
+        self.registry = CollectorRegistry()
+
+    def make_counter(self, name='capped', max_labelsets=2):
+        return Counter(name, 'help', ['user'], max_labelsets=max_labelsets,
+                       overflow_labels={'user': '__overflow__'}, registry=self.registry)
+
+    def test_overflow_aggregates_excess_labelsets(self):
+        c = self.make_counter()
+        c.labels('a').inc()
+        c.labels('b').inc(2)
+        c.labels('c').inc(4)
+        c.labels('d').inc(8)
+        self.assertEqual(1, self.registry.get_sample_value('capped_total', {'user': 'a'}))
+        self.assertEqual(2, self.registry.get_sample_value('capped_total', {'user': 'b'}))
+        self.assertEqual(12, self.registry.get_sample_value('capped_total', {'user': '__overflow__'}))
+        self.assertIsNone(self.registry.get_sample_value('capped_total', {'user': 'c'}))
+        self.assertIsNone(self.registry.get_sample_value('capped_total', {'user': 'd'}))
+
+    def test_admitted_labelsets_keep_precise_values(self):
+        c = self.make_counter()
+        c.labels('a').inc()
+        c.labels('b').inc()
+        c.labels('overflowing').inc(100)  # limit reached, goes to overflow
+        c.labels('a').inc(3)
+        c.labels('b').inc(3)
+        self.assertEqual(4, self.registry.get_sample_value('capped_total', {'user': 'a'}))
+        self.assertEqual(4, self.registry.get_sample_value('capped_total', {'user': 'b'}))
+        self.assertEqual(100, self.registry.get_sample_value('capped_total', {'user': '__overflow__'}))
+
+    def test_labels_returns_stable_child(self):
+        c = self.make_counter(max_labelsets=1)
+        admitted = c.labels('a')
+        self.assertIs(admitted, c.labels('a'))
+        self.assertIs(admitted, c.labels(user='a'))
+        overflow = c.labels('x')
+        self.assertIs(overflow, c.labels('y'))
+        self.assertIs(overflow, c.labels(user='z'))
+        self.assertIsNot(admitted, overflow)
+
+    def test_overflow_labelset_requested_directly(self):
+        c = self.make_counter(max_labelsets=1)
+        c.labels('a').inc()
+        # Requesting the overflow labelset directly hits the same child and
+        # does not consume an admission slot.
+        c.labels('__overflow__').inc(5)
+        c.labels('other').inc()
+        self.assertEqual(6, self.registry.get_sample_value('capped_total', {'user': '__overflow__'}))
+        self.assertEqual(1, self.registry.get_sample_value('capped_total', {'user': 'a'}))
+        self.assertIsNone(self.registry.get_sample_value('capped_total', {'user': 'other'}))
+
+    def test_concurrent_first_creation_respects_limit(self):
+        c = self.make_counter(name='conc', max_labelsets=10)
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            children = list(pool.map(lambda i: c.labels(str(i)), range(500)))
+        # At most 10 admitted labelsets plus the single overflow child.
+        self.assertLessEqual(len(c._metrics), 11)
+        self.assertLessEqual(len({id(child) for child in children}), 11)
+        # Every labelset keeps returning the same child object.
+        for i, child in enumerate(children):
+            self.assertIs(child, c.labels(str(i)))
+
+    def test_histogram_overflow_buckets_and_count_consistent(self):
+        h = Histogram('hc', 'help', ['l'], buckets=[1, 5], max_labelsets=1,
+                      overflow_labels={'l': '__overflow__'}, registry=self.registry)
+        h.labels('a').observe(0.5)
+        h.labels('b').observe(3)
+        h.labels('c').observe(7)
+        labels = {'l': '__overflow__'}
+        self.assertEqual(2, self.registry.get_sample_value('hc_count', labels))
+        self.assertEqual(10, self.registry.get_sample_value('hc_sum', labels))
+        self.assertEqual(0, self.registry.get_sample_value('hc_bucket', dict(labels, le='1.0')))
+        self.assertEqual(1, self.registry.get_sample_value('hc_bucket', dict(labels, le='5.0')))
+        self.assertEqual(2, self.registry.get_sample_value('hc_bucket', dict(labels, le='+Inf')))
+        # The admitted labelset is unaffected.
+        self.assertEqual(1, self.registry.get_sample_value('hc_count', {'l': 'a'}))
+        self.assertEqual(0.5, self.registry.get_sample_value('hc_sum', {'l': 'a'}))
+
+    def test_remove_frees_slot(self):
+        c = self.make_counter(max_labelsets=1)
+        c.labels('a').inc()
+        c.labels('b').inc()  # overflow
+        c.remove('a')
+        c.labels('c').inc()  # admitted into the freed slot
+        self.assertIsNone(self.registry.get_sample_value('capped_total', {'user': 'a'}))
+        self.assertEqual(1, self.registry.get_sample_value('capped_total', {'user': 'c'}))
+        self.assertEqual(1, self.registry.get_sample_value('capped_total', {'user': '__overflow__'}))
+
+    def test_remove_overflow_labelset(self):
+        c = self.make_counter(max_labelsets=1)
+        c.labels('a').inc()
+        c.labels('b').inc(2)
+        c.remove('__overflow__')
+        self.assertIsNone(self.registry.get_sample_value('capped_total', {'user': '__overflow__'}))
+        # The overflow child is recreated on the next overflowing observation.
+        c.labels('c').inc(3)
+        self.assertEqual(3, self.registry.get_sample_value('capped_total', {'user': '__overflow__'}))
+
+    def test_clear_frees_all_slots(self):
+        c = self.make_counter(max_labelsets=1)
+        c.labels('a').inc()
+        c.labels('b').inc()
+        c.clear()
+        c.labels('c').inc()
+        self.assertIsNone(self.registry.get_sample_value('capped_total', {'user': 'a'}))
+        self.assertIsNone(self.registry.get_sample_value('capped_total', {'user': '__overflow__'}))
+        self.assertEqual(1, self.registry.get_sample_value('capped_total', {'user': 'c'}))
+
+    def test_invalid_configuration_rejected(self):
+        # max_labelsets and overflow_labels must be configured together.
+        with pytest.raises(ValueError):
+            Counter('bad1', 'help', ['l'], max_labelsets=2, registry=self.registry)
+        with pytest.raises(ValueError):
+            Counter('bad2', 'help', ['l'], overflow_labels={'l': 'x'}, registry=self.registry)
+        # max_labelsets must be a positive integer.
+        with pytest.raises(ValueError):
+            Counter('bad3', 'help', ['l'], max_labelsets=0,
+                    overflow_labels={'l': 'x'}, registry=self.registry)
+        with pytest.raises(ValueError):
+            Counter('bad4', 'help', ['l'], max_labelsets=1.5,
+                    overflow_labels={'l': 'x'}, registry=self.registry)
+        # overflow_labels must cover exactly the declared label names.
+        with pytest.raises(ValueError):
+            Counter('bad5', 'help', ['l'], max_labelsets=2,
+                    overflow_labels={'wrong': 'x'}, registry=self.registry)
+        with pytest.raises(ValueError):
+            Counter('bad6', 'help', ['l'], max_labelsets=2,
+                    overflow_labels={'l': 'x', 'extra': 'y'}, registry=self.registry)
+        # A limit without label names is meaningless.
+        with pytest.raises(ValueError):
+            Counter('bad7', 'help', max_labelsets=2, overflow_labels={}, registry=self.registry)
+
+    def test_gauge_configuration_rejected(self):
+        with pytest.raises(ValueError):
+            Gauge('g', 'help', ['l'], max_labelsets=2,
+                  overflow_labels={'l': 'x'}, registry=self.registry)
+
+    def test_multiprocess_configuration_rejected(self):
+        class FakeMultiprocessValue:
+            _multiprocess = True
+
+        original = metrics.values.ValueClass
+        metrics.values.ValueClass = FakeMultiprocessValue
+        try:
+            with pytest.raises(ValueError):
+                Counter('mp', 'help', ['l'], max_labelsets=2,
+                        overflow_labels={'l': 'x'}, registry=self.registry)
+        finally:
+            metrics.values.ValueClass = original
+
+    def test_unconfigured_metrics_unaffected(self):
+        c = Counter('plain', 'help', ['l'], registry=self.registry)
+        h = Histogram('plain_h', 'help', ['l'], registry=self.registry)
+        for i in range(1000):
+            c.labels(str(i)).inc()
+            h.labels(str(i)).observe(i)
+        self.assertEqual(1000, len(c._metrics))
+        self.assertEqual(1000, len(h._metrics))
+        self.assertEqual(1, self.registry.get_sample_value('plain_total', {'l': '999'}))
+        self.assertEqual(999, self.registry.get_sample_value('plain_h_sum', {'l': '999'}))
+
+
 class TestMetricFamilies(unittest.TestCase):
     def setUp(self):
         self.registry = CollectorRegistry()
