@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 import unittest
+from unittest import mock
 
 import pytest
 
@@ -539,6 +540,180 @@ class TestHistogram(unittest.TestCase):
             'zyxwvutsrqponmlkjihgfedcba': '26+16 characters',
             'y123456': '7+15 characters',
         })
+
+
+class TestLabelsetLimit(unittest.TestCase):
+    def setUp(self):
+        self.registry = CollectorRegistry()
+
+    def _counter(self, max_labelsets=2, **kwargs):
+        return Counter('c', 'help', ['l'], registry=self.registry,
+                       max_labelsets=max_labelsets,
+                       overflow_labelvalues=('overflow',), **kwargs)
+
+    def test_counter_overflow_aggregates(self):
+        c = self._counter()
+        c.labels('a').inc(1)
+        c.labels('b').inc(2)
+        # Limit reached; new combinations are aggregated into the overflow child.
+        c.labels('x').inc(4)
+        c.labels('y').inc(8)
+        c.labels('z').inc(16)
+        self.assertEqual(1, self.registry.get_sample_value('c_total', {'l': 'a'}))
+        self.assertEqual(2, self.registry.get_sample_value('c_total', {'l': 'b'}))
+        self.assertEqual(28, self.registry.get_sample_value('c_total', {'l': 'overflow'}))
+        self.assertIsNone(self.registry.get_sample_value('c_total', {'l': 'x'}))
+        self.assertIsNone(self.registry.get_sample_value('c_total', {'l': 'y'}))
+
+    def test_admitted_labelsets_stay_precise(self):
+        c = self._counter()
+        c.labels('a').inc()
+        c.labels('b').inc()
+        c.labels('x').inc()  # goes to overflow
+        c.labels('a').inc(10)
+        self.assertEqual(11, self.registry.get_sample_value('c_total', {'l': 'a'}))
+        self.assertEqual(1, self.registry.get_sample_value('c_total', {'l': 'overflow'}))
+
+    def test_overflow_child_is_stable(self):
+        c = self._counter(max_labelsets=1)
+        admitted = c.labels('a')
+        overflow_child = c.labels('x')
+        self.assertIs(overflow_child, c.labels('y'))
+        self.assertIs(overflow_child, c.labels('overflow'))
+        self.assertIs(admitted, c.labels('a'))
+        self.assertIsNot(admitted, overflow_child)
+
+    def test_overflow_labelvalues_do_not_count_against_limit(self):
+        c = self._counter()
+        c.labels('overflow').inc(5)
+        c.labels('a').inc(1)
+        c.labels('b').inc(2)
+        c.labels('x').inc(4)  # limit reached, goes to overflow
+        self.assertEqual(1, self.registry.get_sample_value('c_total', {'l': 'a'}))
+        self.assertEqual(2, self.registry.get_sample_value('c_total', {'l': 'b'}))
+        self.assertEqual(9, self.registry.get_sample_value('c_total', {'l': 'overflow'}))
+
+    def test_concurrent_creation_respects_limit(self):
+        max_labelsets = 10
+        n = 500
+        c = Counter('c', 'help', ['l'], registry=self.registry,
+                    max_labelsets=max_labelsets, overflow_labelvalues=('overflow',))
+
+        def create_and_inc(i):
+            c.labels('v%d' % i).inc()
+            return c.labels('v%d' % i)
+
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            first = list(executor.map(create_and_inc, range(n)))
+            second = list(executor.map(lambda i: c.labels('v%d' % i), range(n)))
+
+        # Returned children are stable across calls.
+        for a, b in zip(first, second):
+            self.assertIs(a, b)
+
+        # At most max_labelsets normal combinations plus the overflow child.
+        self.assertLessEqual(len(c._metrics), max_labelsets + 1)
+        series = [s for m in self.registry.collect() for s in m.samples if s.name == 'c_total']
+        self.assertEqual(max_labelsets + 1, len(series))
+        # No observation is lost.
+        self.assertEqual(n, sum(s.value for s in series))
+        overflow = [s for s in series if s.labels == {'l': 'overflow'}]
+        self.assertEqual(1, len(overflow))
+        self.assertEqual(n - max_labelsets, overflow[0].value)
+
+    def test_histogram_overflow_buckets_and_count(self):
+        h = Histogram('h', 'help', ['l'], registry=self.registry, buckets=[1, 5],
+                      max_labelsets=1, overflow_labelvalues=('overflow',))
+        h.labels('a').observe(0.5)
+        h.labels('x').observe(2)
+        h.labels('y').observe(10)
+        h.labels('z').observe(0.1)
+        self.assertEqual(1, self.registry.get_sample_value('h_count', {'l': 'a'}))
+        self.assertEqual(3, self.registry.get_sample_value('h_count', {'l': 'overflow'}))
+        self.assertAlmostEqual(12.1, self.registry.get_sample_value('h_sum', {'l': 'overflow'}))
+        self.assertEqual(1, self.registry.get_sample_value('h_bucket', {'l': 'overflow', 'le': '1.0'}))
+        self.assertEqual(2, self.registry.get_sample_value('h_bucket', {'l': 'overflow', 'le': '5.0'}))
+        self.assertEqual(3, self.registry.get_sample_value('h_bucket', {'l': 'overflow', 'le': '+Inf'}))
+        # Bucket counts are consistent with the total observation count.
+        self.assertEqual(
+            self.registry.get_sample_value('h_count', {'l': 'overflow'}),
+            self.registry.get_sample_value('h_bucket', {'l': 'overflow', 'le': '+Inf'}))
+        self.assertIsNone(self.registry.get_sample_value('h_count', {'l': 'x'}))
+
+    def test_remove_recycles_slot(self):
+        c = self._counter(max_labelsets=1)
+        c.labels('a').inc()
+        c.labels('x').inc()  # overflow
+        c.remove('a')
+        c.labels('y').inc()  # admitted precisely now that a slot is free
+        self.assertEqual(1, self.registry.get_sample_value('c_total', {'l': 'y'}))
+        self.assertEqual(1, self.registry.get_sample_value('c_total', {'l': 'overflow'}))
+
+    def test_remove_overflow_child(self):
+        c = self._counter(max_labelsets=1)
+        c.labels('a').inc()
+        c.labels('x').inc(3)  # overflow
+        c.remove('overflow')
+        self.assertIsNone(self.registry.get_sample_value('c_total', {'l': 'overflow'}))
+        # The overflow child is recreated on demand.
+        c.labels('y').inc(2)
+        self.assertEqual(2, self.registry.get_sample_value('c_total', {'l': 'overflow'}))
+
+    def test_clear_recycles_all_slots(self):
+        c = self._counter(max_labelsets=1)
+        c.labels('a').inc()
+        c.labels('x').inc()  # overflow
+        c.clear()
+        self.assertEqual(0, len(c._metrics))
+        c.labels('y').inc()
+        c.labels('z').inc()  # overflow again
+        self.assertEqual(1, self.registry.get_sample_value('c_total', {'l': 'y'}))
+        self.assertEqual(1, self.registry.get_sample_value('c_total', {'l': 'overflow'}))
+
+    def test_no_limit_by_default(self):
+        c = Counter('c', 'help', ['l'], registry=self.registry)
+        for i in range(1000):
+            c.labels(str(i)).inc()
+        self.assertEqual(1000, len(c._metrics))
+        self.assertEqual(1, self.registry.get_sample_value('c_total', {'l': '999'}))
+
+    def test_gauge_rejects_limit(self):
+        with self.assertRaises(ValueError):
+            Gauge('g', 'help', ['l'], registry=self.registry,
+                  max_labelsets=1, overflow_labelvalues=('o',))
+
+    def test_summary_rejects_limit(self):
+        with self.assertRaises(ValueError):
+            Summary('s', 'help', ['l'], registry=self.registry,
+                    max_labelsets=1, overflow_labelvalues=('o',))
+
+    def test_multiprocess_rejects_limit(self):
+        with mock.patch.dict(os.environ, {'PROMETHEUS_MULTIPROC_DIR': '/nonexistent'}):
+            with self.assertRaises(ValueError):
+                Counter('c', 'help', ['l'], registry=self.registry,
+                        max_labelsets=1, overflow_labelvalues=('o',))
+            with self.assertRaises(ValueError):
+                Histogram('h', 'help', ['l'], registry=self.registry,
+                          max_labelsets=1, overflow_labelvalues=('o',))
+
+    def test_limit_configuration_validation(self):
+        # Both options must be configured together.
+        self.assertRaises(ValueError, Counter, 'c', 'help', ['l'],
+                          registry=self.registry, max_labelsets=1)
+        self.assertRaises(ValueError, Counter, 'c', 'help', ['l'],
+                          registry=self.registry, overflow_labelvalues=('o',))
+        # Labels are required.
+        self.assertRaises(ValueError, Counter, 'c', 'help',
+                          registry=self.registry, max_labelsets=1,
+                          overflow_labelvalues=('o',))
+        # The limit must be a positive integer.
+        self.assertRaises(ValueError, Counter, 'c', 'help', ['l'],
+                          registry=self.registry, max_labelsets=0,
+                          overflow_labelvalues=('o',))
+        # The overflow combination must match the label names.
+        self.assertRaises(ValueError, Counter, 'c', 'help', ['l'],
+                          registry=self.registry, max_labelsets=1,
+                          overflow_labelvalues=('o', 'p'))
 
 
 class TestInfo(unittest.TestCase):
