@@ -5,13 +5,18 @@ from .metrics_core import (
     SummaryMetricFamily, UnknownMetricFamily, UntypedMetricFamily,
 )
 from .registry import CollectorRegistry, DuplicateTimeseries, REGISTRY
+from .registry_view import (
+    ConstLabelCollisionError, DuplicateMetricError, RegistryView,
+)
 from .samples import BucketSpan, Exemplar, NativeHistogram, Sample, Timestamp
 
 __all__ = (
     'BucketSpan',
     'CollectorRegistry',
+    'ConstLabelCollisionError',
     'Counter',
     'CounterMetricFamily',
+    'DuplicateMetricError',
     'DuplicateTimeseries',
     'Enum',
     'Exemplar',
@@ -25,6 +30,7 @@ __all__ = (
     'Metric',
     'NativeHistogram',
     'REGISTRY',
+    'RegistryView',
     'Sample',
     'StateSetMetricFamily',
     'Summary',

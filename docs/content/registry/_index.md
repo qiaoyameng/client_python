@@ -139,3 +139,39 @@ c = Counter('my_counter', 'A counter', registry=None)
 r = CollectorRegistry()
 c2 = Counter('my_counter', 'A counter', registry=r)
 ```
+
+## Registry views
+
+A `RegistryView` wraps a registry (or any collector) and re-exposes its
+metrics with a name prefix and a set of const labels, without modifying the
+wrapped registry or the objects its collectors return. This is useful when a
+gateway unifies several components that each maintain their own registry.
+
+```python
+from prometheus_client import CollectorRegistry, Counter, RegistryView, generate_latest
+
+component_registry = CollectorRegistry()
+Counter('requests', 'Total requests', registry=component_registry).inc()
+
+view = RegistryView(component_registry, prefix='component_a_', const_labels={'component': 'a'})
+output = generate_latest(view)  # exposes component_a_requests_total{component="a"}
+```
+
+Views can be registered into another registry (their `describe()` is
+consistent with `collect()`), wrapped by further views (prefixes and const
+labels stack), and restricted by view-level sample names via
+`view.restricted_registry(names)`, which maps the names back to the source.
+
+```python
+gateway = CollectorRegistry()
+gateway.register(RegistryView(registry_a, prefix='a_', const_labels={'component': 'a'}))
+gateway.register(RegistryView(registry_b, prefix='b_', const_labels={'component': 'b'}))
+```
+
+All sample name suffixes (`_total`, `_created`, `_bucket`, `_sum`, `_count`,
+`_info`, `_gcount`, `_gsum`) are prefixed along with the metric family, and
+exemplars and native histograms are passed through unchanged. A const label
+that collides with an existing sample label raises
+`ConstLabelCollisionError`, and a transformation that produces two metric
+families with the same name raises `DuplicateMetricError` — conflicts are
+never silently overwritten.
