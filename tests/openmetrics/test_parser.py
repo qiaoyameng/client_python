@@ -266,6 +266,18 @@ nhsp {count:4,sum:6,schema:3,zero_threshold:2.938735877055719e-39,zero_count:1,p
         hfm.add_sample("nhsp", None, None, None, None, NativeHistogram(4, 6, 3, 2.938735877055719e-39, 1, (BucketSpan(0, 1), BucketSpan(7, 1), BucketSpan(4, 1)), None, (1, 0, 0), None))
         self.assertEqual([hfm], families)
 
+    def test_native_histogram_negative_span_offsets(self):
+        families = text_string_to_metric_families("""# TYPE nhneg histogram
+# HELP nhneg Is a native histogram with negative span offsets
+nhneg {count:3,sum:1.5,schema:0,zero_threshold:2.938735877055719e-39,zero_count:0,positive_spans:[-3:1,2:2],positive_deltas:[1,0,1]}
+# EOF
+""")
+        families = list(families)
+
+        hfm = HistogramMetricFamily("nhneg", "Is a native histogram with negative span offsets")
+        hfm.add_sample("nhneg", None, None, None, None, NativeHistogram(3, 1.5, 0, 2.938735877055719e-39, 0, (BucketSpan(-3, 1), BucketSpan(2, 2)), None, (1, 0, 1), None))
+        self.assertEqual([hfm], families)
+
     def test_native_histogram_with_labels(self):
         families = text_string_to_metric_families("""# TYPE hist_w_labels histogram
 # HELP hist_w_labels Is a basic example of a native histogram with labels
