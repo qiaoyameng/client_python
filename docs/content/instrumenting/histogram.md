@@ -127,3 +127,54 @@ myapp_request_duration_seconds_bucket{method="GET",endpoint="/api/users",le="0.1
 myapp_request_duration_seconds_sum{method="GET",endpoint="/api/users"} 3.7
 myapp_request_duration_seconds_count{method="GET",endpoint="/api/users"} 50
 ```
+
+## Native histograms
+
+`NativeHistogramMetric` is an experimental metric type that tracks observations
+in exponential buckets instead of explicitly configured ones. It maintains the
+bucket counts, a zero bucket, and the total count and sum of observations, and
+exposes them as a single native histogram sample.
+
+```python
+from prometheus_client import NativeHistogramMetric
+h = NativeHistogramMetric('request_latency_seconds', 'Description of histogram', schema=3)
+h.observe(0.25)
+```
+
+### Bucket layout
+
+With the configured `schema`, the bucket growth factor (base) is
+`2**(2**-schema)`, and bucket `i` covers `[base**(i-1), base**i)` — the lower
+boundary is inclusive, the upper boundary exclusive. Higher schemas give finer
+buckets. Valid schemas are integers from -4 to 8 (default 3, a growth factor of
+about 1.09). Positive and negative observations are tracked in separate,
+mirrored bucket structures.
+
+### Zero bucket
+
+Observations whose absolute value is less than or equal to `zero_threshold`
+(default `2**-128`) are counted in the zero bucket instead of an exponential
+bucket. The zero threshold is fixed at construction time and cannot be changed
+afterwards — observations already counted in the zero bucket could not be
+redistributed — and it is not affected by resolution reductions. If a different
+zero threshold is needed, create a new metric.
+
+### Bucket count limit
+
+The number of populated buckets per side (positive/negative) is limited to
+`max_buckets` (default 100, `None` disables the limit). When an observation
+would exceed the limit, the schema is reduced by 1 — doubling the bucket width
+and merging adjacent bucket pairs — until both sides fit again or the minimum
+schema of -4 is reached. Merging never loses observation counts.
+
+### NaN and infinite observations
+
+NaN and infinite observations are only added to the total count and sum of
+observations (the sum becomes NaN or infinite accordingly); they are never
+added to any bucket.
+
+### Caveats
+
+Native histograms are only exposed via the OpenMetrics format (version 2.0.0
+and above); the classic text format cannot represent them and skips them.
+Native histograms are single-process only and do not work in multiprocess mode.

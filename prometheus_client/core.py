@@ -1,4 +1,6 @@
-from .metrics import Counter, Enum, Gauge, Histogram, Info, Summary
+from .metrics import (
+    Counter, Enum, Gauge, Histogram, Info, NativeHistogramMetric, Summary,
+)
 from .metrics_core import (
     CounterMetricFamily, GaugeHistogramMetricFamily, GaugeMetricFamily,
     HistogramMetricFamily, InfoMetricFamily, Metric, StateSetMetricFamily,
@@ -24,6 +26,7 @@ __all__ = (
     'InfoMetricFamily',
     'Metric',
     'NativeHistogram',
+    'NativeHistogramMetric',
     'REGISTRY',
     'Sample',
     'StateSetMetricFamily',

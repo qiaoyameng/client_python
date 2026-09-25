@@ -14,7 +14,7 @@ from .exposition import (
 from .gc_collector import GC_COLLECTOR, GCCollector
 from .metrics import (
     Counter, disable_created_metrics, enable_created_metrics, Enum, Gauge,
-    Histogram, Info, Summary,
+    Histogram, Info, NativeHistogramMetric, Summary,
 )
 from .metrics_core import Metric
 from .platform_collector import PLATFORM_COLLECTOR, PlatformCollector
@@ -29,6 +29,7 @@ __all__ = (
     'Gauge',
     'Summary',
     'Histogram',
+    'NativeHistogramMetric',
     'Info',
     'Enum',
     'enable_created_metrics',

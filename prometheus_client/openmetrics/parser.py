@@ -307,7 +307,7 @@ def _parse_nh_sample(text, suffixes):
 
 def _parse_nh_struct(text):
     pattern = r'(\w+):\s*([^,}]+)'
-    re_spans = re.compile(r'(positive_spans|negative_spans):\[(\d+:\d+(,\d+:\d+)*)\]')
+    re_spans = re.compile(r'(positive_spans|negative_spans):\[(-?\d+:\d+(,-?\d+:\d+)*)\]')
     re_deltas = re.compile(r'(positive_deltas|negative_deltas):\[(-?\d+(?:,-?\d+)*)\]')
 
     items = dict(re.findall(pattern, text))
@@ -421,7 +421,9 @@ def _check_histogram(samples, name):
     for s in samples:
         suffix = s.name[len(name):]
         g = _group_for_sample(s, name, 'histogram')
-        if len(suffix) == 0:
+        if len(suffix) == 0 or suffix == '_created':
+            # Native histogram samples and _created metadata are not part
+            # of the classic histogram bucket structure.
             continue
         if g != group or s.timestamp != timestamp:
             if group is not None:

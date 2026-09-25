@@ -1,3 +1,4 @@
+import math
 import os
 from threading import Lock
 import time
@@ -12,7 +13,9 @@ from . import values  # retain this import style for testability
 from .context_managers import ExceptionCounter, InprogressTracker, Timer
 from .metrics_core import Metric
 from .registry import Collector, CollectorRegistry, REGISTRY
-from .samples import Exemplar, Sample
+from .samples import (
+    BucketSpan, Exemplar, NativeHistogram as NativeHistogramSample, Sample,
+)
 from .utils import floatToGoString, INF
 from .validation import (
     _validate_exemplar, _validate_labelnames, _validate_metric_name,
@@ -702,6 +705,236 @@ class Histogram(MetricWrapperBase):
             samples.append(Sample('_sum', {}, self._sum.get(), None, None))
         if _use_created:
             samples.append(Sample('_created', {}, self._created, None, None))
+        return tuple(samples)
+
+
+def _native_bucket_lower_bound(index: int, schema: int) -> float:
+    """Lower (inclusive) boundary of the native histogram bucket with the given index."""
+    try:
+        return 2.0 ** ((index - 1) * 2.0 ** -schema)
+    except OverflowError:
+        # The boundary is beyond the float64 range, so any finite
+        # observation compares smaller than it.
+        return math.inf
+
+
+def _native_bucket_index(value: float, schema: int) -> int:
+    """Return the index of the native histogram bucket containing value.
+
+    value must be positive and finite. With base = 2**(2**-schema), bucket i
+    covers [base**(i-1), base**i): the lower boundary is inclusive and the
+    upper boundary is exclusive.
+    """
+    index = math.floor(math.log2(value) * 2.0 ** schema) + 1
+    # Correct for floating point inaccuracies around bucket boundaries.
+    while value < _native_bucket_lower_bound(index, schema):
+        index -= 1
+    while value >= _native_bucket_lower_bound(index + 1, schema):
+        index += 1
+    return index
+
+
+def _merge_native_buckets(buckets: Dict[int, int]) -> Dict[int, int]:
+    """Merge adjacent bucket pairs, halving the resolution (schema - 1).
+
+    Buckets 2j-1 and 2j at schema s exactly cover bucket j at schema s-1,
+    so no observations are lost.
+    """
+    merged: Dict[int, int] = {}
+    for index, count in buckets.items():
+        merged[(index + 1) // 2] = merged.get((index + 1) // 2, 0) + count
+    return merged
+
+
+def _native_spans_and_deltas(buckets: Dict[int, int]) -> Tuple[Optional[Tuple[BucketSpan, ...]], Optional[Tuple[int, ...]]]:
+    """Convert a bucket index -> count map into spans and count deltas."""
+    if not buckets:
+        return None, None
+    spans = []
+    deltas = []
+    start = 0
+    length = 0
+    offset_base = 0
+    prev_index = 0
+    prev_count = 0
+    for index in sorted(buckets):
+        count = buckets[index]
+        if length and index == prev_index + 1:
+            length += 1
+        else:
+            if length:
+                spans.append(BucketSpan(start - offset_base, length))
+                offset_base = start + length
+            start = index
+            length = 1
+        deltas.append(count - prev_count)
+        prev_index = index
+        prev_count = count
+    spans.append(BucketSpan(start - offset_base, length))
+    return tuple(spans), tuple(deltas)
+
+
+class NativeHistogramMetric(MetricWrapperBase):
+    """A Native Histogram tracks the size and number of events in exponential buckets.
+
+    Unlike the classic Histogram, bucket boundaries are not configured
+    explicitly. Instead, buckets are laid out exponentially: with the
+    configured `schema`, the bucket growth factor (base) is 2**(2**-schema),
+    and bucket i covers [base**(i-1), base**i) - the lower boundary is
+    inclusive, the upper boundary exclusive. Positive and negative
+    observations are tracked in separate, mirrored bucket structures.
+
+    Observations whose absolute value is less than or equal to
+    `zero_threshold` are counted in the zero bucket instead. The zero
+    threshold is fixed at construction time and cannot be changed
+    afterwards: observations already counted in the zero bucket could not
+    be redistributed into exponential buckets. It is also left untouched
+    by resolution reductions (see below). If a different zero threshold is
+    needed, create a new metric.
+
+    The number of populated buckets per side (positive/negative) is limited
+    to `max_buckets`. When an observation would exceed the limit, the
+    schema is reduced by 1 (doubling the bucket width, merging adjacent
+    bucket pairs) until both sides fit again or the minimum schema of -4
+    is reached. Merging never loses observation counts. Set `max_buckets`
+    to None to disable the limit.
+
+    NaN and infinite observations are only added to the total count and
+    sum of observations (the sum becomes NaN or infinite accordingly);
+    they are never added to any bucket.
+
+    Native histograms are only exposed via the OpenMetrics format (version
+    2.0.0 and above); the classic text format cannot represent them.
+
+    Native histograms do not work in multiprocess mode; they are
+    single-process only.
+
+    Example:
+
+        from prometheus_client import NativeHistogramMetric
+
+        h = NativeHistogramMetric('request_latency_seconds', 'Request latency', schema=3)
+        h.observe(0.25)
+    """
+    _type = 'histogram'
+
+    MIN_SCHEMA = -4
+    MAX_SCHEMA = 8
+    DEFAULT_SCHEMA = 3
+    DEFAULT_ZERO_THRESHOLD = 2.938735877055719e-39  # 2**-128
+    DEFAULT_MAX_BUCKETS: Optional[int] = 100
+
+    def __init__(self,
+                 name: str,
+                 documentation: str,
+                 labelnames: Iterable[str] = (),
+                 namespace: str = '',
+                 subsystem: str = '',
+                 unit: str = '',
+                 registry: Optional[CollectorRegistry] = REGISTRY,
+                 _labelvalues: Optional[Sequence[str]] = None,
+                 schema: int = DEFAULT_SCHEMA,
+                 zero_threshold: float = DEFAULT_ZERO_THRESHOLD,
+                 max_buckets: Optional[int] = DEFAULT_MAX_BUCKETS,
+                 ):
+        if not isinstance(schema, int) or not self.MIN_SCHEMA <= schema <= self.MAX_SCHEMA:
+            raise ValueError(f'Schema must be an integer between {self.MIN_SCHEMA} and {self.MAX_SCHEMA}')
+        zero_threshold = float(zero_threshold)
+        if zero_threshold < 0:
+            raise ValueError('Zero threshold must not be negative')
+        if max_buckets is not None and max_buckets < 1:
+            raise ValueError('Max buckets must be a positive integer or None')
+        self._initial_schema = schema
+        self._zero_threshold = zero_threshold
+        self._max_buckets = max_buckets
+        super().__init__(
+            name=name,
+            documentation=documentation,
+            labelnames=labelnames,
+            namespace=namespace,
+            subsystem=subsystem,
+            unit=unit,
+            registry=registry,
+            _labelvalues=_labelvalues,
+        )
+        self._kwargs['schema'] = schema
+        self._kwargs['zero_threshold'] = zero_threshold
+        self._kwargs['max_buckets'] = max_buckets
+
+    def _metric_init(self) -> None:
+        self._lock = Lock()
+        self._created = time.time()
+        self._schema = self._initial_schema
+        self._count = 0
+        self._sum = 0.0
+        self._zero_count = 0
+        self._pos_buckets: Dict[int, int] = {}
+        self._neg_buckets: Dict[int, int] = {}
+
+    def observe(self, amount: float) -> None:
+        """Observe the given amount.
+
+        Positive and negative amounts are tracked in separate exponential
+        bucket structures. Amounts whose absolute value is less than or
+        equal to the zero threshold are counted in the zero bucket. NaN
+        and infinite amounts are only added to the count and sum of
+        observations, never to a bucket.
+        """
+        self._raise_if_not_observable()
+        amount = float(amount)
+        with self._lock:
+            self._count += 1
+            self._sum += amount
+            if math.isnan(amount) or math.isinf(amount):
+                return
+            if abs(amount) <= self._zero_threshold:
+                self._zero_count += 1
+            elif amount > 0:
+                index = _native_bucket_index(amount, self._schema)
+                self._pos_buckets[index] = self._pos_buckets.get(index, 0) + 1
+                self._limit_buckets()
+            else:
+                index = _native_bucket_index(-amount, self._schema)
+                self._neg_buckets[index] = self._neg_buckets.get(index, 0) + 1
+                self._limit_buckets()
+
+    def _limit_buckets(self) -> None:
+        # Must be called with self._lock held.
+        if self._max_buckets is None:
+            return
+        while self._schema > self.MIN_SCHEMA and (
+                len(self._pos_buckets) > self._max_buckets
+                or len(self._neg_buckets) > self._max_buckets):
+            self._schema -= 1
+            self._pos_buckets = _merge_native_buckets(self._pos_buckets)
+            self._neg_buckets = _merge_native_buckets(self._neg_buckets)
+
+    def time(self) -> Timer:
+        """Time a block of code or function, and observe the duration in seconds.
+
+        Can be used as a function decorator or context manager.
+        """
+        return Timer(self, 'observe')
+
+    def _child_samples(self) -> Iterable[Sample]:
+        with self._lock:
+            pos_spans, pos_deltas = _native_spans_and_deltas(self._pos_buckets)
+            neg_spans, neg_deltas = _native_spans_and_deltas(self._neg_buckets)
+            native_histogram = NativeHistogramSample(
+                count_value=self._count,
+                sum_value=self._sum,
+                schema=self._schema,
+                zero_threshold=self._zero_threshold,
+                zero_count=self._zero_count,
+                pos_spans=pos_spans,
+                neg_spans=neg_spans,
+                pos_deltas=pos_deltas,
+                neg_deltas=neg_deltas,
+            )
+            created = self._created
+        samples = [Sample('', {}, None, None, None, native_histogram)]
+        if _use_created:
+            samples.append(Sample('_created', {}, created, None, None))
         return tuple(samples)
 
 

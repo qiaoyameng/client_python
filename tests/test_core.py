@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import math
 import os
 import time
 import unittest
@@ -9,8 +10,9 @@ from prometheus_client import metrics
 from prometheus_client.core import (
     CollectorRegistry, Counter, CounterMetricFamily, DuplicateTimeseries, Enum,
     Gauge, GaugeHistogramMetricFamily, GaugeMetricFamily, Histogram,
-    HistogramMetricFamily, Info, InfoMetricFamily, Metric, Sample,
-    StateSetMetricFamily, Summary, SummaryMetricFamily, UntypedMetricFamily,
+    HistogramMetricFamily, Info, InfoMetricFamily, Metric,
+    NativeHistogramMetric, Sample, StateSetMetricFamily, Summary,
+    SummaryMetricFamily, UntypedMetricFamily,
 )
 from prometheus_client.decorator import getargspec
 from prometheus_client.metrics import _get_use_created
@@ -539,6 +541,246 @@ class TestHistogram(unittest.TestCase):
             'zyxwvutsrqponmlkjihgfedcba': '26+16 characters',
             'y123456': '7+15 characters',
         })
+
+
+class TestNativeHistogramMetric(unittest.TestCase):
+    def setUp(self):
+        self.registry = CollectorRegistry()
+
+    def _get_native_histogram(self, name='nh', labels=None):
+        for metric in self.registry.collect():
+            for s in metric.samples:
+                if s.name == name and s.native_histogram is not None:
+                    if labels is None or s.labels == labels:
+                        return s.native_histogram
+        return None
+
+    @staticmethod
+    def _expand_buckets(spans, deltas):
+        """Expand spans and deltas back into a bucket index -> count dict."""
+        buckets = {}
+        index = 0
+        count = 0
+        delta_iter = iter(deltas or ())
+        for span in spans or ():
+            index += span.offset
+            for _ in range(span.length):
+                count += next(delta_iter)
+                buckets[index] = count
+                index += 1
+        return buckets
+
+    def test_repr(self):
+        histogram = NativeHistogramMetric('nh', 'help', registry=self.registry)
+        self.assertEqual(repr(histogram), "prometheus_client.metrics.NativeHistogramMetric(nh)")
+
+    def test_observe_positive_negative_mirror(self):
+        histogram = NativeHistogramMetric('nh', 'help', schema=0, zero_threshold=0.001, registry=self.registry)
+        for value in [1.0, 1.5, 2.0, 3.0, 100.0]:
+            histogram.observe(value)
+            histogram.observe(-value)
+        nh = self._get_native_histogram()
+        self.assertEqual(10, nh.count_value)
+        self.assertEqual(0.0, nh.sum_value)
+        self.assertEqual(0, nh.zero_count)
+        # schema 0: bucket i covers [2**(i-1), 2**i).
+        expected = {1: 2, 2: 2, 7: 1}
+        self.assertEqual(expected, self._expand_buckets(nh.pos_spans, nh.pos_deltas))
+        # Negative observations mirror the positive ones.
+        self.assertEqual(expected, self._expand_buckets(nh.neg_spans, nh.neg_deltas))
+
+    def test_bucket_boundaries(self):
+        histogram = NativeHistogramMetric('nh', 'help', schema=0, zero_threshold=0.0, registry=self.registry)
+        # Lower boundary inclusive, upper boundary exclusive:
+        # bucket i covers [2**(i-1), 2**i) with schema 0.
+        histogram.observe(1.0)  # bucket 1
+        histogram.observe(math.nextafter(1.0, 0.0))  # bucket 0
+        histogram.observe(2.0)  # bucket 2
+        histogram.observe(math.nextafter(2.0, 0.0))  # bucket 1
+        histogram.observe(0.5)  # bucket 0
+        histogram.observe(math.nextafter(0.5, 0.0))  # bucket -1
+        nh = self._get_native_histogram()
+        self.assertEqual({-1: 1, 0: 2, 1: 2, 2: 1}, self._expand_buckets(nh.pos_spans, nh.pos_deltas))
+
+    def test_bucket_boundaries_higher_schema(self):
+        histogram = NativeHistogramMetric('nh', 'help', schema=2, zero_threshold=0.0, registry=self.registry)
+        # schema 2: base is 2**(1/4), bucket i covers [2**((i-1)/4), 2**(i/4)).
+        histogram.observe(2.0 ** 0.25)  # exactly the lower bound of bucket 2
+        histogram.observe(math.nextafter(2.0 ** 0.25, 0.0))  # just below: bucket 1
+        histogram.observe(2.0 ** 0.5)  # exactly the lower bound of bucket 3
+        nh = self._get_native_histogram()
+        self.assertEqual({1: 1, 2: 1, 3: 1}, self._expand_buckets(nh.pos_spans, nh.pos_deltas))
+
+    def test_zero_bucket(self):
+        histogram = NativeHistogramMetric('nh', 'help', schema=0, zero_threshold=0.1, registry=self.registry)
+        histogram.observe(0.0)
+        histogram.observe(0.1)  # threshold is inclusive
+        histogram.observe(-0.1)
+        histogram.observe(0.2)
+        nh = self._get_native_histogram()
+        self.assertEqual(3, nh.zero_count)
+        self.assertEqual(4, nh.count_value)
+        self.assertEqual({-2: 1}, self._expand_buckets(nh.pos_spans, nh.pos_deltas))
+        self.assertEqual(0.1, nh.zero_threshold)
+
+    def test_zero_threshold_zero(self):
+        histogram = NativeHistogramMetric('nh', 'help', schema=0, zero_threshold=0.0, registry=self.registry)
+        histogram.observe(0.0)
+        histogram.observe(-0.0)
+        histogram.observe(0.5)
+        nh = self._get_native_histogram()
+        self.assertEqual(2, nh.zero_count)
+        self.assertEqual({0: 1}, self._expand_buckets(nh.pos_spans, nh.pos_deltas))
+
+    def test_schema_reduction_preserves_counts(self):
+        histogram = NativeHistogramMetric('nh', 'help', schema=0, zero_threshold=0.001,
+                                          max_buckets=2, registry=self.registry)
+        histogram.observe(1.0)  # bucket 1 at schema 0
+        histogram.observe(2.0)  # bucket 2 at schema 0
+        self.assertEqual(0, self._get_native_histogram().schema)
+        histogram.observe(4.0)  # bucket 3 at schema 0, exceeds max_buckets
+        nh = self._get_native_histogram()
+        # One reduction to schema -1 (base 4): buckets 1 and 2 merge into
+        # bucket 1 ([1, 4)), bucket 3 becomes bucket 2 ([4, 16)).
+        self.assertEqual(-1, nh.schema)
+        self.assertEqual({1: 2, 2: 1}, self._expand_buckets(nh.pos_spans, nh.pos_deltas))
+        self.assertEqual(3, nh.count_value)
+        self.assertEqual(7.0, nh.sum_value)
+        # The zero threshold is not changed by resolution reductions.
+        self.assertEqual(0.001, nh.zero_threshold)
+
+    def test_multiple_schema_reductions(self):
+        histogram = NativeHistogramMetric('nh', 'help', schema=1, zero_threshold=0.001,
+                                          max_buckets=1, registry=self.registry)
+        histogram.observe(0.0005)  # zero bucket, unaffected by reductions
+        histogram.observe(1.0)
+        histogram.observe(100.0)
+        nh = self._get_native_histogram()
+        # Repeated halving until a single bucket remains: schema 1 -> -3,
+        # both observations end up in bucket 1 ([1, 256)) at schema -3.
+        self.assertEqual(-3, nh.schema)
+        self.assertEqual({1: 2}, self._expand_buckets(nh.pos_spans, nh.pos_deltas))
+        self.assertEqual(3, nh.count_value)
+        self.assertEqual(1, nh.zero_count)
+        self.assertEqual(101.0005, nh.sum_value)
+
+    def test_max_buckets_none_disables_limit(self):
+        histogram = NativeHistogramMetric('nh', 'help', schema=0, max_buckets=None, registry=self.registry)
+        for exponent in range(20):
+            histogram.observe(2.0 ** exponent)
+        nh = self._get_native_histogram()
+        self.assertEqual(0, nh.schema)
+        self.assertEqual(20, len(self._expand_buckets(nh.pos_spans, nh.pos_deltas)))
+
+    def test_nan_and_inf_only_counted_in_count_and_sum(self):
+        histogram = NativeHistogramMetric('nh', 'help', schema=0, registry=self.registry)
+        histogram.observe(1.0)
+        histogram.observe(float('inf'))
+        histogram.observe(float('-inf'))
+        histogram.observe(float('nan'))
+        nh = self._get_native_histogram()
+        self.assertEqual(4, nh.count_value)
+        self.assertTrue(math.isnan(nh.sum_value))
+        self.assertEqual(0, nh.zero_count)
+        self.assertEqual({1: 1}, self._expand_buckets(nh.pos_spans, nh.pos_deltas))
+        self.assertEqual({}, self._expand_buckets(nh.neg_spans, nh.neg_deltas))
+
+    def test_extreme_values(self):
+        histogram = NativeHistogramMetric('nh', 'help', schema=0, zero_threshold=0.0, registry=self.registry)
+        histogram.observe(1.7e308)  # close to the float64 maximum
+        histogram.observe(5e-324)  # smallest positive denormal
+        nh = self._get_native_histogram()
+        buckets = self._expand_buckets(nh.pos_spans, nh.pos_deltas)
+        self.assertEqual(2, nh.count_value)
+        self.assertEqual(2, sum(buckets.values()))
+
+    def test_invalid_config(self):
+        self.assertRaises(ValueError, NativeHistogramMetric, 'nh', 'help', registry=None, schema=9)
+        self.assertRaises(ValueError, NativeHistogramMetric, 'nh', 'help', registry=None, schema=-5)
+        self.assertRaises(ValueError, NativeHistogramMetric, 'nh', 'help', registry=None, schema=1.5)
+        self.assertRaises(ValueError, NativeHistogramMetric, 'nh', 'help', registry=None, zero_threshold=-1)
+        self.assertRaises(ValueError, NativeHistogramMetric, 'nh', 'help', registry=None, max_buckets=0)
+
+    def test_not_observable(self):
+        histogram = NativeHistogramMetric('nh', 'help', ['l'], registry=self.registry)
+        assert_not_observable(histogram.observe, 1)
+
+    def test_labels(self):
+        histogram = NativeHistogramMetric('nh', 'help', ['l'], schema=0, registry=self.registry)
+        histogram.labels('a').observe(1.0)
+        histogram.labels('b').observe(-1.0)
+        nh_a = self._get_native_histogram(labels={'l': 'a'})
+        nh_b = self._get_native_histogram(labels={'l': 'b'})
+        # Children inherit the configured schema.
+        self.assertEqual(0, nh_a.schema)
+        self.assertEqual({1: 1}, self._expand_buckets(nh_a.pos_spans, nh_a.pos_deltas))
+        self.assertEqual({1: 1}, self._expand_buckets(nh_b.neg_spans, nh_b.neg_deltas))
+
+    def test_concurrent_observe_and_collect(self):
+        histogram = NativeHistogramMetric('nh', 'help', schema=0, registry=self.registry)
+        errors = []
+        observations_per_thread = 2000
+
+        def observe_many():
+            for i in range(observations_per_thread):
+                histogram.observe(1.0 + (i % 10))
+                histogram.observe(-0.5)
+
+        def collect_many():
+            for _ in range(500):
+                for metric in self.registry.collect():
+                    for s in metric.samples:
+                        nh = s.native_histogram
+                        if nh is None:
+                            continue
+                        pos = self._expand_buckets(nh.pos_spans, nh.pos_deltas)
+                        neg = self._expand_buckets(nh.neg_spans, nh.neg_deltas)
+                        # No half-applied observation may ever be visible.
+                        total = nh.zero_count + sum(pos.values()) + sum(neg.values())
+                        if nh.count_value != total:
+                            errors.append((nh.count_value, total))
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(observe_many) for _ in range(2)]
+            futures += [executor.submit(collect_many) for _ in range(2)]
+            for future in futures:
+                future.result()
+
+        self.assertEqual([], errors)
+        nh = self._get_native_histogram()
+        self.assertEqual(4 * observations_per_thread, nh.count_value)
+        pos = self._expand_buckets(nh.pos_spans, nh.pos_deltas)
+        neg = self._expand_buckets(nh.neg_spans, nh.neg_deltas)
+        self.assertEqual(nh.count_value, nh.zero_count + sum(pos.values()) + sum(neg.values()))
+
+    def test_openmetrics_roundtrip(self):
+        from prometheus_client import exposition
+        from prometheus_client.openmetrics import exposition as openmetrics_exposition
+        from prometheus_client.openmetrics.parser import text_string_to_metric_families
+
+        histogram = NativeHistogramMetric('nh', 'help', schema=2, zero_threshold=0.001, registry=self.registry)
+        for value in [0.0005, 1.0, 1.5, 2.0, 3.0, -1.0, -2.5, 100.0, 0.25]:
+            histogram.observe(value)
+
+        collected = self._get_native_histogram()
+
+        output = openmetrics_exposition.generate_latest(self.registry, version="2.0.0").decode('utf-8')
+        parsed = None
+        for family in text_string_to_metric_families(output):
+            for s in family.samples:
+                if s.name == 'nh' and s.native_histogram is not None:
+                    parsed = s.native_histogram
+        self.assertIsNotNone(parsed)
+        self.assertEqual(collected, parsed)
+
+        # OpenMetrics versions below 2.0.0 cannot represent native histograms.
+        output_1_0 = openmetrics_exposition.generate_latest(self.registry, version="1.0.0").decode('utf-8')
+        self.assertNotIn('count:', output_1_0)
+
+        # The classic text format skips native histograms but must not fail.
+        classic = exposition.generate_latest(self.registry).decode('utf-8')
+        self.assertIn('# TYPE nh histogram', classic)
+        self.assertNotIn('count:', classic)
 
 
 class TestInfo(unittest.TestCase):
