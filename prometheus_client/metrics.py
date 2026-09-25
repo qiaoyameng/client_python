@@ -6,8 +6,6 @@ from typing import (
     Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple,
     Type, TypeVar, Union,
 )
-import warnings
-
 from . import values  # retain this import style for testability
 from .context_managers import ExceptionCounter, InprogressTracker, Timer
 from .metrics_core import Metric
@@ -203,11 +201,6 @@ class MetricWrapperBase(Collector):
             return self._metrics[str_labelvalues]
 
     def remove(self, *labelvalues: Any) -> None:
-        if 'prometheus_multiproc_dir' in os.environ or 'PROMETHEUS_MULTIPROC_DIR' in os.environ:
-            warnings.warn(
-                "Removal of labels has not been implemented in  multi-process mode yet.",
-                UserWarning)
-
         if not self._labelnames:
             raise ValueError('No label names were set when constructing %s' % self)
 
@@ -218,15 +211,11 @@ class MetricWrapperBase(Collector):
         with self._lock:
             if labelvalues in self._metrics:
                 del self._metrics[labelvalues]
+        if 'prometheus_multiproc_dir' in os.environ or 'PROMETHEUS_MULTIPROC_DIR' in os.environ:
+            values.remove_multiprocess_series(self._name, self._labelnames, labelvalues)
 
     def remove_by_labels(self, labels: dict[str, str]) -> None:
         """Remove all series whose labelset partially matches the given labels."""
-        if 'prometheus_multiproc_dir' in os.environ or 'PROMETHEUS_MULTIPROC_DIR' in os.environ:
-            warnings.warn(
-                "Removal of labels has not been implemented in  multi-process mode yet.",
-                UserWarning
-            )
-
         if not self._labelnames:
             raise ValueError('No label names were set when constructing %s' % self)
         
@@ -250,18 +239,18 @@ class MetricWrapperBase(Collector):
                 if all(lv[pos] == want for pos, want in pos_filter.items()):
                     # pop with default avoids KeyError if concurrently removed
                     self._metrics.pop(lv, None)
+        if 'prometheus_multiproc_dir' in os.environ or 'PROMETHEUS_MULTIPROC_DIR' in os.environ:
+            values.remove_multiprocess_series_by_labels(self._name, labels)
         
 
     def clear(self) -> None:
         """Remove all labelsets from the metric"""
         if not self._labelnames:
             return
-        if 'prometheus_multiproc_dir' in os.environ or 'PROMETHEUS_MULTIPROC_DIR' in os.environ:
-            warnings.warn(
-                "Clearing labels has not been implemented in multi-process mode yet",
-                UserWarning)
         with self._lock:
             self._metrics = {}
+        if 'prometheus_multiproc_dir' in os.environ or 'PROMETHEUS_MULTIPROC_DIR' in os.environ:
+            values.clear_multiprocess_series(self._name)
 
     def _samples(self) -> Iterable[Sample]:
         if self._is_parent():

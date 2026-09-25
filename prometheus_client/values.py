@@ -3,7 +3,10 @@ from threading import Lock
 from typing import Callable, List
 import warnings
 
-from .mmap_dict import mmap_key, MmapedDict
+from .mmap_dict import (
+    delete_series, GenerationStore, mmap_key_with_generation,
+    mmap_series_key, MmapedDict,
+)
 
 _multi_process_cleanups: List[Callable[[], None]] = []
 
@@ -97,8 +100,17 @@ def MultiProcessValue(process_identifier=os.getpid):
 
                 files[file_prefix] = MmapedDict(filename)
             self._file = files[file_prefix]
-            self._key = mmap_key(metric_name, name, labelnames, labelvalues, help_text)
-            self._value, self._timestamp = self._file.read_value(self._key)
+            directory = os.path.dirname(self._file._fname)
+            store = GenerationStore(directory)
+            series_key = mmap_series_key(metric_name, dict(zip(labelnames, labelvalues)), typ == 'histogram')
+            # The generation read and the entry initialization must be atomic
+            # with respect to a concurrent remove/clear, so that a series
+            # created while it is being deleted ends up either fully in the
+            # old generation (and thus deleted) or fully in the new one.
+            with store.locked():
+                generation = store.get_locked(series_key)
+                self._key = mmap_key_with_generation(metric_name, name, labelnames, labelvalues, help_text, generation)
+                self._value, self._timestamp = self._file.read_value(self._key)
 
         def __check_for_pid_change(self):
             actual_pid = process_identifier()
@@ -161,3 +173,34 @@ def get_value_class():
 
 
 ValueClass = get_value_class()
+
+
+def _multiprocess_dir():
+    return os.environ.get('PROMETHEUS_MULTIPROC_DIR', os.environ.get('prometheus_multiproc_dir'))
+
+
+def remove_multiprocess_series(metric_name, labelnames, labelvalues):
+    """Remove the series with the exact given labelset from all multiprocess files."""
+    directory = _multiprocess_dir()
+    if directory:
+        expected = {k: str(v) for k, v in zip(labelnames, labelvalues)}
+        # Match on the metric's own labels only, so that internal sample
+        # labels such as a histogram's 'le' don't prevent the match.
+        delete_series(directory, metric_name,
+                      lambda labels: all(labels.get(k) == v for k, v in expected.items()))
+
+
+def remove_multiprocess_series_by_labels(metric_name, labels):
+    """Remove all series whose labelset partially matches the given labels."""
+    directory = _multiprocess_dir()
+    if directory:
+        expected = {k: str(v) for k, v in labels.items()}
+        delete_series(directory, metric_name,
+                      lambda candidate: all(candidate.get(k) == v for k, v in expected.items()))
+
+
+def clear_multiprocess_series(metric_name):
+    """Remove all series of the metric from all multiprocess files."""
+    directory = _multiprocess_dir()
+    if directory:
+        delete_series(directory, metric_name, lambda labels: True)

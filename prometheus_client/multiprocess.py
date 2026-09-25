@@ -1,12 +1,13 @@
 from collections import defaultdict
 import glob
-import json
 import os
 import warnings
 
 from .metrics import Gauge
 from .metrics_core import Metric
-from .mmap_dict import MmapedDict
+from .mmap_dict import (
+    GenerationStore, mmap_series_key, MmapedDict, parse_mmap_key,
+)
 from .samples import Sample
 from .utils import floatToGoString
 
@@ -40,20 +41,26 @@ class MultiProcessCollector:
         But if writing the merged data back to mmap files, use
         accumulate=False to avoid compound accumulation.
         """
-        metrics = MultiProcessCollector._read_metrics(files)
+        generations = {}
+        if files:
+            generations = GenerationStore(os.path.dirname(files[0])).read_all()
+        metrics = MultiProcessCollector._read_metrics(files, generations)
         return MultiProcessCollector._accumulate_metrics(metrics, accumulate)
 
     @staticmethod
-    def _read_metrics(files):
+    def _read_metrics(files, generations=None):
         metrics = {}
         key_cache = {}
+        generations = generations or {}
 
         def _parse_key(key):
-            val = key_cache.get(key)
+            cache_key = (typ, key)
+            val = key_cache.get(cache_key)
             if not val:
-                metric_name, name, labels, help_text = json.loads(key)
+                metric_name, name, labels, help_text, generation = parse_mmap_key(key)
                 labels_key = tuple(sorted(labels.items()))
-                val = key_cache[key] = (metric_name, name, labels, labels_key, help_text)
+                series_key = mmap_series_key(metric_name, labels, typ == 'histogram')
+                val = key_cache[cache_key] = (metric_name, name, labels, labels_key, help_text, generation, series_key)
             return val
 
         for f in files:
@@ -69,7 +76,12 @@ class MultiProcessCollector:
                     continue
                 raise
             for key, value, timestamp, _ in file_values:
-                metric_name, name, labels, labels_key, help_text = _parse_key(key)
+                metric_name, name, labels, labels_key, help_text, generation, series_key = _parse_key(key)
+
+                if generation != generations.get(series_key, 0):
+                    # The entry belongs to a series incarnation that has since
+                    # been removed; a stale process may still be writing it.
+                    continue
 
                 metric = metrics.get(metric_name)
                 if metric is None:

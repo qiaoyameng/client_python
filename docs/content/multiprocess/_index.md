@@ -22,7 +22,6 @@ This comes with a number of limitations:
 - The pushgateway cannot be used
 - Gauges cannot use the `pid` label
 - Exemplars are not supported
-- Remove and Clear of labels are currently not supported in multiprocess mode.
 
 There's several steps to getting this working:
 
@@ -102,6 +101,36 @@ from prometheus_client import Gauge
 # Example gauge
 IN_PROGRESS = Gauge("inprogress_requests", "help", multiprocess_mode='livesum')
 ```
+
+**5. Removing and clearing series (e.g. short-lived tenants)**:
+
+`remove`, `remove_by_labels` and `clear` work in multiprocess mode. A removal
+applies to the whole multiprocess directory: the series is deleted from the
+data files of every process, including dead ones, not just from the calling
+process. All samples of a series are removed as a unit (a counter's `_total`,
+a histogram's buckets, `_sum` and `_count`, and gauges of every
+`multiprocess_mode`).
+
+Each series has a deletion generation, persisted in `generations.json` in the
+multiprocess directory and guarded by `generations.lock`. Removing a series
+increments its generation and tombstones its entries in every data file;
+re-creating a series with the same name and labels starts from zero under the
+new generation. Processes that still hold a reference to a removed child keep
+writing into their old (now ignored) entries, so stale values are never
+resurrected at collection time. The collector only exposes entries whose
+generation matches the current one.
+
+File format compatibility:
+
+- Files written by older clients (and any series that was never removed) use
+  the original key format and remain fully readable.
+- Once a series is removed, its new entries are tagged with the generation
+  and its old entries are tombstoned. Clients older than this change cannot
+  parse such entries, so all processes sharing a directory (writers and the
+  collector) should run the same client version before `remove`/`clear` is
+  used. If `remove`/`clear` is never used, the on-disk format is unchanged.
+- `generations.json` is wiped together with the rest of the directory between
+  runs, as recommended above.
 
 ## API Reference
 
