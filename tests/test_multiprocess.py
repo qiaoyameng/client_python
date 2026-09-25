@@ -1,7 +1,11 @@
 import glob
 import os
 import shutil
+import struct
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 import warnings
 
@@ -477,21 +481,172 @@ class TestMultiProcess(unittest.TestCase):
             os.path.join(self.tempdir, 'gauge_livesum_9999999.db'),
         ]))
 
-    def test_remove_clear_warning(self):
-        os.environ['PROMETHEUS_MULTIPROC_DIR'] = self.tempdir
-        with warnings.catch_warnings(record=True) as w:
-            values.ValueClass = get_value_class()
-            registry = CollectorRegistry()
-            collector = MultiProcessCollector(registry)
-            counter = Counter('c', 'help', labelnames=['label'], registry=None)
-            counter.labels('label').inc()
-            counter.remove('label')
-            counter.clear()
-            assert os.environ['PROMETHEUS_MULTIPROC_DIR'] == self.tempdir
-            assert issubclass(w[0].category, UserWarning)
-            assert "Removal of labels has not been implemented" in str(w[0].message)
-            assert issubclass(w[-1].category, UserWarning)
-            assert "Clearing labels has not been implemented" in str(w[-1].message)
+    def test_remove_counter_across_processes(self):
+        c1 = Counter('c', 'help', labelnames=['l'], registry=None)
+        c1_child = c1.labels('x')
+        c1_other = c1.labels('y')
+        values.ValueClass = MultiProcessValue(lambda: 456)
+        c2 = Counter('c', 'help', labelnames=['l'], registry=None)
+        stale_child = c2.labels('x')
+        c1_child.inc(5)
+        stale_child.inc(3)
+        c1_other.inc(7)
+        self.assertEqual(8, self.registry.get_sample_value('c_total', {'l': 'x'}))
+        c1.remove('x')
+        # The series is gone from every process file, other series are kept.
+        self.assertIsNone(self.registry.get_sample_value('c_total', {'l': 'x'}))
+        self.assertEqual(7, self.registry.get_sample_value('c_total', {'l': 'y'}))
+        # A stale handle in another process only contributes its delta after
+        # the deletion, it must not resurrect the old value.
+        stale_child.inc(2)
+        self.assertEqual(2, self.registry.get_sample_value('c_total', {'l': 'x'}))
+
+    def test_remove_and_recreate_series(self):
+        c = Counter('c', 'help', labelnames=['l'], registry=None)
+        c.labels('x').inc(5)
+        c.remove('x')
+        self.assertIsNone(self.registry.get_sample_value('c_total', {'l': 'x'}))
+        # Recreating a series with the same labels starts from scratch.
+        c.labels('x').inc(4)
+        self.assertEqual(4, self.registry.get_sample_value('c_total', {'l': 'x'}))
+
+    def test_remove_is_idempotent(self):
+        c = Counter('c', 'help', labelnames=['l'], registry=None)
+        c.labels('x').inc(5)
+        c.remove('x')
+        c.remove('x')
+        # Removing a series that never existed is a no-op.
+        c.remove('never_existed')
+        self.assertIsNone(self.registry.get_sample_value('c_total', {'l': 'x'}))
+
+    def test_remove_by_labels_across_processes(self):
+        c1 = Counter('c', 'help', labelnames=['tenant', 'path'], registry=None)
+        values.ValueClass = MultiProcessValue(lambda: 456)
+        c2 = Counter('c', 'help', labelnames=['tenant', 'path'], registry=None)
+        c1.labels('t1', '/a').inc(1)
+        c2.labels('t1', '/b').inc(2)
+        c2.labels('t2', '/a').inc(4)
+        c1.remove_by_labels({'tenant': 't1'})
+        self.assertIsNone(self.registry.get_sample_value('c_total', {'tenant': 't1', 'path': '/a'}))
+        self.assertIsNone(self.registry.get_sample_value('c_total', {'tenant': 't1', 'path': '/b'}))
+        self.assertEqual(4, self.registry.get_sample_value('c_total', {'tenant': 't2', 'path': '/a'}))
+
+    def test_clear_across_processes(self):
+        c1 = Counter('c', 'help', labelnames=['l'], registry=None)
+        values.ValueClass = MultiProcessValue(lambda: 456)
+        c2 = Counter('c', 'help', labelnames=['l'], registry=None)
+        c1.labels('x').inc(1)
+        c2.labels('y').inc(2)
+        c2.clear()
+        self.assertIsNone(self.registry.get_sample_value('c_total', {'l': 'x'}))
+        self.assertIsNone(self.registry.get_sample_value('c_total', {'l': 'y'}))
+        # The metric can be reused after a clear.
+        c1.labels('z').inc(3)
+        self.assertEqual(3, self.registry.get_sample_value('c_total', {'l': 'z'}))
+
+    def test_remove_histogram_series(self):
+        h1 = Histogram('h', 'help', labelnames=['l'], registry=None, buckets=[1, 5])
+        h1_child = h1.labels('x')
+        h1_other = h1.labels('y')
+        values.ValueClass = MultiProcessValue(lambda: 456)
+        h2 = Histogram('h', 'help', labelnames=['l'], registry=None, buckets=[1, 5])
+        stale_child = h2.labels('x')
+        h1_child.observe(0.5)
+        stale_child.observe(3)
+        h1_other.observe(2)
+        self.assertEqual(2, self.registry.get_sample_value('h_count', {'l': 'x'}))
+        h1.remove('x')
+        # The whole series (buckets, sum and count) is gone.
+        self.assertIsNone(self.registry.get_sample_value('h_count', {'l': 'x'}))
+        self.assertIsNone(self.registry.get_sample_value('h_sum', {'l': 'x'}))
+        self.assertIsNone(self.registry.get_sample_value('h_bucket', {'l': 'x', 'le': '1.0'}))
+        self.assertEqual(1, self.registry.get_sample_value('h_count', {'l': 'y'}))
+        # A stale handle only records observations made after the deletion.
+        stale_child.observe(4)
+        self.assertEqual(1, self.registry.get_sample_value('h_count', {'l': 'x'}))
+        self.assertEqual(4, self.registry.get_sample_value('h_sum', {'l': 'x'}))
+        self.assertEqual(1, self.registry.get_sample_value('h_bucket', {'l': 'x', 'le': '5.0'}))
+        # Samples the stale handle did not touch stay deleted; recreating the
+        # child via remove() + .labels() re-initializes the complete series.
+        self.assertIsNone(self.registry.get_sample_value('h_bucket', {'l': 'x', 'le': '1.0'}))
+        h2.remove('x')
+        h2.labels('x')
+        self.assertEqual(0, self.registry.get_sample_value('h_bucket', {'l': 'x', 'le': '1.0'}))
+        self.assertEqual(0, self.registry.get_sample_value('h_count', {'l': 'x'}))
+
+    def test_remove_gauge_modes(self):
+        for mode in ('all', 'min', 'max', 'sum', 'mostrecent',
+                     'liveall', 'livemin', 'livemax', 'livesum', 'livemostrecent'):
+            g1 = Gauge('g_' + mode, 'help', labelnames=['l'], registry=None, multiprocess_mode=mode)
+            g1_child = g1.labels('x')
+            values.ValueClass = MultiProcessValue(lambda: 456)
+            g2 = Gauge('g_' + mode, 'help', labelnames=['l'], registry=None, multiprocess_mode=mode)
+            g1_child.set(1)
+            g2.labels('x').set(2)
+            g1.remove('x')
+            self.assertFalse(
+                any(s.labels.get('l') == 'x'
+                    for m in self.collector.collect() if m.name == 'g_' + mode
+                    for s in m.samples),
+                mode)
+            values.ValueClass = MultiProcessValue(lambda: 123)
+
+    def test_remove_gauge_sum_stale_handle(self):
+        g1 = Gauge('g', 'help', labelnames=['l'], registry=None, multiprocess_mode='sum')
+        g1_child = g1.labels('x')
+        values.ValueClass = MultiProcessValue(lambda: 456)
+        g2 = Gauge('g', 'help', labelnames=['l'], registry=None, multiprocess_mode='sum')
+        stale_child = g2.labels('x')
+        g1_child.inc(10)
+        stale_child.inc(5)
+        self.assertEqual(15, self.registry.get_sample_value('g', {'l': 'x'}))
+        g1.remove('x')
+        self.assertIsNone(self.registry.get_sample_value('g', {'l': 'x'}))
+        # Only the delta after the deletion is visible.
+        stale_child.inc(2)
+        self.assertEqual(2, self.registry.get_sample_value('g', {'l': 'x'}))
+        # An absolute set recreates the series with the new value.
+        stale_child.set(42)
+        self.assertEqual(42, self.registry.get_sample_value('g', {'l': 'x'}))
+
+    def test_remove_gauge_mostrecent_stale_handle(self):
+        g1 = Gauge('g', 'help', labelnames=['l'], registry=None, multiprocess_mode='mostrecent')
+        g1_child = g1.labels('x')
+        values.ValueClass = MultiProcessValue(lambda: 456)
+        g2 = Gauge('g', 'help', labelnames=['l'], registry=None, multiprocess_mode='mostrecent')
+        stale_child = g2.labels('x')
+        g1_child.set(1)
+        stale_child.set(2)
+        g1.remove('x')
+        self.assertIsNone(self.registry.get_sample_value('g', {'l': 'x'}))
+        stale_child.set(3)
+        self.assertEqual(3, self.registry.get_sample_value('g', {'l': 'x'}))
+
+    def test_old_format_file_compatibility(self):
+        # Files written by older versions have zero padding where the deletion
+        # generation now lives. They must be readable, and deletable, as
+        # generation 0 files.
+        key = mmap_dict.mmap_key('c', 'c_total', ('l',), ('x',), 'help')
+        encoded = key.encode('utf-8')
+        padded = encoded + b' ' * (8 - (len(encoded) + 4) % 8)
+        entry = struct.pack('i', len(encoded)) + padded + struct.pack('dd', 11.0, 0.0)
+        filename = os.path.join(self.tempdir, 'counter_123.db')
+        with open(filename, 'wb') as f:
+            f.write(struct.pack('ii', 8 + len(entry), 0))
+            f.write(entry)
+            f.truncate(mmap_dict._INITIAL_MMAP_SIZE)
+        self.assertEqual(11, self.registry.get_sample_value('c_total', {'l': 'x'}))
+        c = Counter('c', 'help', labelnames=['l'], registry=None)
+        c.remove('x')
+        self.assertIsNone(self.registry.get_sample_value('c_total', {'l': 'x'}))
+        # The file was upgraded in place: generation bumped, entry tombstoned.
+        d = mmap_dict.MmapedDict(filename)
+        self.assertEqual(1, d.read_generation())
+        self.assertEqual([], list(d.read_all_values()))
+        d.close()
+        # New writes to the same series start fresh.
+        c.labels('x').inc(3)
+        self.assertEqual(3, self.registry.get_sample_value('c_total', {'l': 'x'}))
     
     def test_child_name_is_built_once_with_namespace_subsystem_unit(self):
         """
@@ -638,6 +793,49 @@ class TestMmapedDict(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             list(self.d.read_all_values())
 
+    def test_delete_matching_tombstones(self):
+        self.d.write_value('abc', 1.0, 0.0)
+        self.d.write_value('def', 2.0, 0.0)
+        self.assertEqual(1, self.d.delete_matching(lambda k: k == 'abc'))
+        self.assertEqual([('def', 2.0, 0.0)], list(self.d.read_all_values()))
+        # The deletion generation was bumped.
+        self.assertEqual(1, self.d.read_generation())
+        # A second deletion matching nothing neither changes data nor bumps
+        # the generation, so other handles are not unnecessarily invalidated.
+        self.assertEqual(0, self.d.delete_matching(lambda k: k == 'abc'))
+        self.assertEqual(1, self.d.read_generation())
+        # Positions of surviving entries still work.
+        self.d.write_value('def', 5.0, 0.0)
+        self.assertEqual([('def', 5.0, 0.0)], list(self.d.read_all_values()))
+
+    def test_sync_picks_up_external_tombstone(self):
+        self.d.write_value('abc', 100.0, 0.0)
+        # Simulate another process deleting the entry with a second handle.
+        other = mmap_dict.MmapedDict(self.tempfile)
+        other.delete_matching(lambda k: k == 'abc')
+        other.close()
+        self.assertTrue(self.d.sync())
+        self.assertNotIn('abc', self.d._positions)
+        self.assertEqual(None, self.d.read_value_if_present('abc'))
+        self.assertEqual([], list(self.d.read_all_values()))
+        # Writing recreates the series from zero.
+        self.d.write_value('abc', 1.0, 0.0)
+        self.assertEqual([('abc', 1.0, 0.0)], list(self.d.read_all_values()))
+        self.assertFalse(self.d.sync())
+
+    def test_old_files_have_generation_zero(self):
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            with open(path, 'wb') as f:
+                f.write(struct.pack('ii', 8, 0))
+                f.truncate(mmap_dict._INITIAL_MMAP_SIZE)
+            d = mmap_dict.MmapedDict(path)
+            self.assertEqual(0, d.read_generation())
+            d.close()
+        finally:
+            os.unlink(path)
+
     def tearDown(self):
         self.d.close()
         os.unlink(self.tempfile)
@@ -660,3 +858,193 @@ class TestUnsetEnv(unittest.TestCase):
 
     def tearDown(self):
         os.remove(self.tmpfl)
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# A worker process that keeps a reference to a labelled child across a deletion
+# performed by another process. It writes before and after the deletion.
+_STALE_HANDLE_SCRIPT = r'''
+import os
+import time
+from prometheus_client import Counter, Gauge, Histogram
+
+sync_dir = os.environ['SYNC_DIR']
+kind = os.environ['METRIC_KIND']
+
+
+def wait_for(name):
+    while not os.path.exists(os.path.join(sync_dir, name)):
+        time.sleep(0.01)
+
+
+if kind == 'counter':
+    metric = Counter('m', 'help', ['tenant'], registry=None)
+    child = metric.labels('t1')
+    child.inc(10)
+    wait_for('ready-ack')
+    open(os.path.join(sync_dir, 'ready'), 'w').close()
+    wait_for('deleted')
+    child.inc(1)
+elif kind == 'gauge':
+    metric = Gauge('m', 'help', ['tenant'], registry=None, multiprocess_mode='livesum')
+    child = metric.labels('t1')
+    child.inc(10)
+    wait_for('ready-ack')
+    open(os.path.join(sync_dir, 'ready'), 'w').close()
+    wait_for('deleted')
+    child.inc(1)
+elif kind == 'histogram':
+    metric = Histogram('m', 'help', ['tenant'], registry=None, buckets=[1.0, 5.0])
+    child = metric.labels('t1')
+    child.observe(3)
+    wait_for('ready-ack')
+    open(os.path.join(sync_dir, 'ready'), 'w').close()
+    wait_for('deleted')
+    child.observe(4)
+
+open(os.path.join(sync_dir, 'done'), 'w').close()
+wait_for('exit')
+'''
+
+_REMOVE_SCRIPT = r'''
+from prometheus_client import Counter, Gauge, Histogram
+
+kind = __import__('os').environ['METRIC_KIND']
+if kind == 'counter':
+    Counter('m', 'help', ['tenant'], registry=None).remove('t1')
+elif kind == 'gauge':
+    Gauge('m', 'help', ['tenant'], registry=None, multiprocess_mode='livesum').remove('t1')
+elif kind == 'histogram':
+    Histogram('m', 'help', ['tenant'], registry=None, buckets=[1.0, 5.0]).remove('t1')
+'''
+
+_INC_SCRIPT = r'''
+import os
+from prometheus_client import Counter
+
+c = Counter('c', 'help', ['tenant'], registry=None)
+c.labels('t1').inc(float(os.environ['AMOUNT']))
+'''
+
+_REMOVE_COUNTER_SCRIPT = r'''
+from prometheus_client import Counter
+
+c = Counter('c', 'help', ['tenant'], registry=None)
+c.remove('t1')
+# Removing a series that never existed is a no-op.
+c.remove('never_existed')
+# Repeated removal of the same series is a no-op.
+c.remove('t1')
+'''
+
+
+@unittest.skipIf(os.name == 'nt', 'POSIX mmap and process semantics required')
+class TestMultiProcessSubprocesses(unittest.TestCase):
+    """Tests with real OS processes: a deleter, a writer holding a stale handle,
+    and a collector run as independent processes."""
+
+    def setUp(self):
+        self.tempdir = tempfile.mkdtemp()
+        self.sync_dir = os.path.join(self.tempdir, 'sync')
+        os.makedirs(self.sync_dir)
+        self.env = dict(
+            os.environ,
+            PROMETHEUS_MULTIPROC_DIR=self.tempdir,
+            PYTHONPATH=_REPO_ROOT + os.pathsep + os.environ.get('PYTHONPATH', ''),
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tempdir, ignore_errors=True)
+
+    def _run(self, script, extra_env=None, timeout=30):
+        env = dict(self.env)
+        if extra_env:
+            env.update(extra_env)
+        result = subprocess.run(
+            [sys.executable, '-c', script],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout)
+        if result.returncode != 0:
+            raise AssertionError('subprocess failed:\n' + result.stderr.decode('utf-8'))
+
+    def _start(self, script, extra_env=None):
+        env = dict(self.env)
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.Popen(
+            [sys.executable, '-c', script],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _wait_for(self, name, timeout=15):
+        deadline = time.time() + timeout
+        while not os.path.exists(os.path.join(self.sync_dir, name)):
+            self.assertLess(time.time(), deadline, 'timed out waiting for %s' % name)
+            time.sleep(0.02)
+
+    def _touch(self, name):
+        open(os.path.join(self.sync_dir, name), 'w').close()
+
+    def _collect_value(self, name, labels=None):
+        registry = CollectorRegistry()
+        MultiProcessCollector(registry, path=self.tempdir)
+        return registry.get_sample_value(name, labels)
+
+    def _stale_handle_scenario(self, kind, sample_name, expected_after_delete):
+        worker = self._start(_STALE_HANDLE_SCRIPT,
+                             {'SYNC_DIR': self.sync_dir, 'METRIC_KIND': kind})
+        try:
+            self._touch('ready-ack')
+            self._wait_for('ready')
+            self.assertEqual(expected_after_delete[0], self._collect_value(sample_name, {'tenant': 't1'}))
+            # A second, independent process performs the removal.
+            self._run(_REMOVE_SCRIPT, {'METRIC_KIND': kind})
+            self.assertIsNone(self._collect_value(sample_name, {'tenant': 't1'}))
+            # The writer still holds the old child handle.
+            self._touch('deleted')
+            self._wait_for('done')
+            self.assertEqual(expected_after_delete[1], self._collect_value(sample_name, {'tenant': 't1'}))
+        finally:
+            self._touch('exit')
+            stdout, stderr = worker.communicate(timeout=15)
+            self.assertEqual(0, worker.returncode, stderr.decode('utf-8'))
+
+    def test_counter_remove_stale_handle_collector(self):
+        # before delete: 10; after the stale handle's next write: only the delta
+        self._stale_handle_scenario('counter', 'm_total', (10, 1))
+
+    def test_gauge_remove_stale_handle_collector(self):
+        self._stale_handle_scenario('gauge', 'm', (10, 1))
+
+    def test_histogram_remove_stale_handle_collector(self):
+        self._stale_handle_scenario('histogram', 'm_count', (1, 1))
+        self.assertEqual(4, self._collect_value('m_sum', {'tenant': 't1'}))
+        self.assertEqual(1, self._collect_value('m_bucket', {'tenant': 't1', 'le': '5.0'}))
+
+    def test_restart_and_recreate(self):
+        self._run(_INC_SCRIPT, {'AMOUNT': '5'})
+        self.assertEqual(5, self._collect_value('c_total', {'tenant': 't1'}))
+        # A restarted worker continues accumulating in its own file.
+        self._run(_INC_SCRIPT, {'AMOUNT': '3'})
+        self.assertEqual(8, self._collect_value('c_total', {'tenant': 't1'}))
+        # Tenant off-boarding: delete across all files.
+        self._run(_REMOVE_COUNTER_SCRIPT)
+        self.assertIsNone(self._collect_value('c_total', {'tenant': 't1'}))
+        # A freshly started process re-creating the series starts from zero.
+        self._run(_INC_SCRIPT, {'AMOUNT': '2'})
+        self.assertEqual(2, self._collect_value('c_total', {'tenant': 't1'}))
+
+    def test_repeated_remove(self):
+        self._run(_INC_SCRIPT, {'AMOUNT': '7'})
+        self.assertEqual(7, self._collect_value('c_total', {'tenant': 't1'}))
+        # Repeated deletion and deletion of a non-existent series do not raise
+        # and do not bring the data back.
+        self._run(_REMOVE_COUNTER_SCRIPT)
+        self.assertIsNone(self._collect_value('c_total', {'tenant': 't1'}))
+
+    def test_concurrent_create(self):
+        workers = [self._start(_INC_SCRIPT, {'AMOUNT': '25'}) for _ in range(4)]
+        for worker in workers:
+            stdout, stderr = worker.communicate(timeout=30)
+            self.assertEqual(0, worker.returncode, stderr.decode('utf-8'))
+        self.assertEqual(100, self._collect_value('c_total', {'tenant': 't1'}))

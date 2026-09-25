@@ -22,7 +22,6 @@ This comes with a number of limitations:
 - The pushgateway cannot be used
 - Gauges cannot use the `pid` label
 - Exemplars are not supported
-- Remove and Clear of labels are currently not supported in multiprocess mode.
 
 There's several steps to getting this working:
 
@@ -152,3 +151,29 @@ from prometheus_client import multiprocess
 def child_exit(server, worker):
     multiprocess.mark_process_dead(worker.pid)
 ```
+
+## Removing and clearing label series
+
+`remove()`, `remove_by_labels()` and `clear()` work in multiprocess mode. In
+addition to dropping the child from the calling process, they delete the
+series from **every** process data file in `PROMETHEUS_MULTIPROC_DIR`, so the
+series disappears from collection immediately. All samples belonging to the
+series are treated as one unit: every aggregation mode of a Gauge, the total
+of a Counter, and the buckets/sum/count of a Histogram are removed together.
+
+Deletion is tracked with a **deletion generation** counter stored in each data
+file. A process that still holds a removed child object (a stale handle)
+detects the generation change on its next write, discards its locally
+accumulated value, and re-reads from the file. As a result a stale handle can
+never resurrect the old value: a stale Counter or Gauge `inc()` only
+contributes the delta accumulated since the deletion, and a Gauge `set()`
+recreates the series with the new absolute value. Samples of a stale Histogram
+handle are recreated lazily as they are touched; to fully re-create a series,
+call `remove()` and then `.labels()` again, which re-initializes all of its
+samples from zero.
+
+Compatibility with files written by older versions of the library: they carry
+deletion generation 0 and are read and deleted transparently. The reverse is
+not true — deleted entries are tombstoned in place, a marker that versions
+without removal support cannot parse. Upgrade all processes before using
+`remove()`/`clear()` in multiprocess mode.

@@ -174,6 +174,38 @@ class MultiProcessCollector:
 _LIVE_GAUGE_MULTIPROCESS_MODES = {m for m in Gauge._MULTIPROC_MODES if m.startswith('live')}
 
 
+def _delete_series_from_files(typ, metric_name, label_matcher, path=None):
+    """Delete a metric series from every process file in the multiprocess directory.
+
+    All mmap entries belonging to the series (e.g. every bucket, sum and count
+    of a Histogram, or the total of a Counter) are tombstoned and the deletion
+    generation of each affected file is bumped, so processes still holding a
+    stale child handle will not resurrect the old value on their next write.
+
+    `label_matcher` is a dict of label names to values that a series must match
+    exactly, or None to match every series of the metric (clear()).
+    """
+    if path is None:
+        path = os.environ.get('PROMETHEUS_MULTIPROC_DIR', os.environ.get('prometheus_multiproc_dir'))
+    if not path:
+        return
+
+    def predicate(key):
+        key_metric_name, _, labels, _ = json.loads(key)
+        if key_metric_name != metric_name:
+            return False
+        if label_matcher is None:
+            return True
+        return all(labels.get(name) == value for name, value in label_matcher.items())
+
+    for f in glob.glob(os.path.join(path, typ + '_*.db')):
+        d = MmapedDict(f)
+        try:
+            d.delete_matching(predicate)
+        finally:
+            d.close()
+
+
 def mark_process_dead(pid, path=None):
     """Do bookkeeping for when one process dies in a multi-process setup."""
     if path is None:

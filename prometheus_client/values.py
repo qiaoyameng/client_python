@@ -97,6 +97,11 @@ def MultiProcessValue(process_identifier=os.getpid):
 
                 files[file_prefix] = MmapedDict(filename)
             self._file = files[file_prefix]
+            # Another process (or this one, via remove()/clear()) may have
+            # tombstoned entries since this file handle was opened. Pick up
+            # the current generation so a recreated series starts fresh.
+            self._file.sync()
+            self._generation = self._file.read_generation()
             self._key = mmap_key(metric_name, name, labelnames, labelvalues, help_text)
             self._value, self._timestamp = self._file.read_value(self._key)
 
@@ -111,9 +116,24 @@ def MultiProcessValue(process_identifier=os.getpid):
                 for value in values:
                     value.__reset()
 
+        def __sync_with_file(self):
+            # The deletion generation is tracked per value object, as each one
+            # holds its own locally accumulated copy of the value. If the
+            # generation changed, entries may have been tombstoned by
+            # remove()/clear(): drop the local value and re-read from the file
+            # so a stale handle cannot resurrect a deleted series.
+            generation = self._file.read_generation()
+            if generation == self._generation:
+                return
+            self._generation = generation
+            self._file.sync()
+            current = self._file.read_value_if_present(self._key)
+            self._value, self._timestamp = current if current is not None else (0.0, 0.0)
+
         def inc(self, amount):
             with lock:
                 self.__check_for_pid_change()
+                self.__sync_with_file()
                 self._value += amount
                 self._timestamp = 0.0
                 self._file.write_value(self._key, self._value, self._timestamp)
@@ -121,6 +141,7 @@ def MultiProcessValue(process_identifier=os.getpid):
         def set(self, value, timestamp=None):
             with lock:
                 self.__check_for_pid_change()
+                self.__sync_with_file()
                 self._value = value
                 self._timestamp = timestamp or 0.0
                 self._file.write_value(self._key, self._value, self._timestamp)
@@ -132,6 +153,7 @@ def MultiProcessValue(process_identifier=os.getpid):
         def get(self):
             with lock:
                 self.__check_for_pid_change()
+                self.__sync_with_file()
                 return self._value
 
         def get_exemplar(self):
