@@ -1,3 +1,4 @@
+import math
 import os
 from threading import Lock
 import time
@@ -11,6 +12,7 @@ import warnings
 from . import values  # retain this import style for testability
 from .context_managers import ExceptionCounter, InprogressTracker, Timer
 from .metrics_core import Metric
+from .quantile import TimeWindowQuantiles
 from .registry import Collector, CollectorRegistry, REGISTRY
 from .samples import Exemplar, Sample
 from .utils import floatToGoString, INF
@@ -533,15 +535,89 @@ class Summary(MetricWrapperBase):
 
         with REQUEST_TIME.time():
             pass  # Logic to be timed
+
+    A Summary can optionally track quantiles over a sliding time window:
+
+        from prometheus_client import Summary
+
+        s = Summary('request_latency_seconds', 'Request latency',
+                    quantiles=[(0.5, 0.05), (0.9, 0.01), (0.99, 0.001)],
+                    max_age=600, age_buckets=5)
+
+    `quantiles` is a sequence of `(quantile, allowed_rank_error)` tuples.
+    Quantiles are estimated over a sliding window of `max_age` seconds,
+    approximated by `age_buckets` rotating time slices, using a bounded
+    CKMS summary (observations are not stored). The effective window is
+    between `max_age - max_age_error` and `max_age` seconds, where
+    `max_age_error == max_age / age_buckets`. While the window holds no
+    observations the quantile samples are reported as NaN; `_count` and
+    `_sum` keep accumulating regardless. Quantile tracking is only
+    available in single-process mode.
     """
     _type = 'summary'
     _reserved_labelnames = ['quantile']
+
+    def __init__(self,
+                 name: str,
+                 documentation: str,
+                 labelnames: Iterable[str] = (),
+                 namespace: str = '',
+                 subsystem: str = '',
+                 unit: str = '',
+                 registry: Optional[CollectorRegistry] = REGISTRY,
+                 _labelvalues: Optional[Sequence[str]] = None,
+                 quantiles: Sequence[Tuple[float, float]] = (),
+                 max_age: float = 600.0,
+                 age_buckets: int = 5,
+                 clock: Optional[Callable[[], float]] = None,
+                 ):
+        self._quantiles = tuple(quantiles)
+        if self._quantiles and values.ValueClass._multiprocess:
+            raise ValueError('Summary quantiles are not supported in multiprocess mode')
+        self._quantile_max_age = float(max_age)
+        self._quantile_age_buckets = int(age_buckets)
+        self._clock = clock if clock is not None else time.time
+        super().__init__(
+            name=name,
+            documentation=documentation,
+            labelnames=labelnames,
+            namespace=namespace,
+            subsystem=subsystem,
+            unit=unit,
+            registry=registry,
+            _labelvalues=_labelvalues,
+        )
+        if self._quantiles:
+            self._kwargs['quantiles'] = self._quantiles
+            self._kwargs['max_age'] = self._quantile_max_age
+            self._kwargs['age_buckets'] = self._quantile_age_buckets
+            self._kwargs['clock'] = self._clock
 
     def _metric_init(self) -> None:
         self._count = values.ValueClass(self._type, self._name, self._name + '_count', self._labelnames,
                                         self._labelvalues, self._documentation)
         self._sum = values.ValueClass(self._type, self._name, self._name + '_sum', self._labelnames, self._labelvalues, self._documentation)
         self._created = time.time()
+        if self._quantiles:
+            self._quantile_estimator: Optional[TimeWindowQuantiles] = TimeWindowQuantiles(
+                self._quantiles, self._quantile_max_age, self._quantile_age_buckets, self._clock)
+        else:
+            self._quantile_estimator = None
+
+    @property
+    def max_age(self) -> Optional[float]:
+        """The nominal quantile window size in seconds, or None if quantile tracking is disabled."""
+        return self._quantile_estimator.max_age if self._quantile_estimator is not None else None
+
+    @property
+    def age_buckets(self) -> Optional[int]:
+        """The number of time slices approximating the quantile window, or None if disabled."""
+        return self._quantile_estimator.age_buckets if self._quantile_estimator is not None else None
+
+    @property
+    def max_age_error(self) -> Optional[float]:
+        """The maximum error in the effective quantile window size, or None if disabled."""
+        return self._quantile_estimator.max_age_error if self._quantile_estimator is not None else None
 
     def observe(self, amount: float) -> None:
         """Observe the given amount.
@@ -552,8 +628,14 @@ class Summary(MetricWrapperBase):
         observations. See
         https://prometheus.io/docs/practices/histograms/#count-and-sum-of-observations
         for details.
+
+        If quantile tracking is enabled, the amount must be finite.
         """
         self._raise_if_not_observable()
+        if self._quantile_estimator is not None:
+            if not math.isfinite(amount):
+                raise ValueError('Summary quantile tracking only accepts finite observations, got %r' % (amount,))
+            self._quantile_estimator.observe(amount)
         self._count.inc(1)
         self._sum.inc(amount)
 
@@ -565,7 +647,14 @@ class Summary(MetricWrapperBase):
         return Timer(self, 'observe')
 
     def _child_samples(self) -> Iterable[Sample]:
-        samples = [
+        samples = []
+        if self._quantile_estimator is not None:
+            snapshot = self._quantile_estimator.snapshot()
+            samples += [
+                Sample('', {'quantile': floatToGoString(quantile)}, snapshot[quantile], None, None)
+                for quantile, _ in self._quantiles
+            ]
+        samples += [
             Sample('_count', {}, self._count.get(), None, None),
             Sample('_sum', {}, self._sum.get(), None, None),
         ]
