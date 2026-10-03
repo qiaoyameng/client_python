@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 
 from . import (
-    exposition, gc_collector, metrics, metrics_core, platform_collector,
-    process_collector, registry,
+    delta, exposition, gc_collector, metrics, metrics_core,
+    platform_collector, process_collector, registry,
 )
+from .delta import DeltaCollector
 from .exposition import (
     CONTENT_TYPE_LATEST, CONTENT_TYPE_PLAIN_0_0_4, CONTENT_TYPE_PLAIN_1_0_0,
     delete_from_gateway, generate_latest, instance_ip_grouping_key,
@@ -24,6 +25,7 @@ from .registry import CollectorRegistry, REGISTRY
 __all__ = (
     'CollectorRegistry',
     'REGISTRY',
+    'DeltaCollector',
     'Metric',
     'Counter',
     'Gauge',
