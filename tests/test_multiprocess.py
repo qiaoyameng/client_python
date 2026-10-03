@@ -90,6 +90,11 @@ class TestMultiProcess(unittest.TestCase):
         self.assertEqual(2, self.registry.get_sample_value('s_count'))
         self.assertEqual(3, self.registry.get_sample_value('s_sum'))
 
+    def test_summary_quantiles_are_rejected(self):
+        with self.assertRaisesRegex(
+                ValueError, 'not supported in multi-process mode'):
+            Summary('s_quantiles', 'help', quantiles=(0.5,), registry=None)
+
     def test_histogram_adds(self):
         h1 = Histogram('h', 'help', registry=None)
         values.ValueClass = MultiProcessValue(lambda: 456)

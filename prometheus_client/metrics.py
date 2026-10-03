@@ -1,16 +1,18 @@
 import os
+import math
 from threading import Lock
 import time
 import types
 from typing import (
-    Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple,
-    Type, TypeVar, Union,
+    Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence,
+    Tuple, Type, TypeVar, Union,
 )
 import warnings
 
 from . import values  # retain this import style for testability
 from .context_managers import ExceptionCounter, InprogressTracker, Timer
 from .metrics_core import Metric
+from .quantiles import TimeWindowQuantiles
 from .registry import Collector, CollectorRegistry, REGISTRY
 from .samples import Exemplar, Sample
 from .utils import floatToGoString, INF
@@ -537,11 +539,165 @@ class Summary(MetricWrapperBase):
     _type = 'summary'
     _reserved_labelnames = ['quantile']
 
+    def __init__(
+        self,
+        name: str,
+        documentation: str,
+        labelnames: Iterable[str] = (),
+        namespace: str = '',
+        subsystem: str = '',
+        unit: str = '',
+        registry: Optional[CollectorRegistry] = REGISTRY,
+        quantiles: Union[Sequence[float], Mapping[float, float], None] = None,
+        rank_error: float = 0.01,
+        max_age_seconds: float = 600.0,
+        time_slices: int = 5,
+        clock: Optional[Callable[[], float]] = None,
+        objectives: Union[Sequence[float], Mapping[float, float], None] = None,
+        age_buckets: Optional[int] = None,
+        rank_errors: Union[float, Mapping[float, float], None] = None,
+        _labelvalues: Optional[Sequence[str]] = None,
+    ) -> None:
+        if objectives is not None and quantiles is not None:
+            raise ValueError('Specify only one of quantiles and objectives.')
+        if objectives is not None:
+            quantiles = objectives
+        if age_buckets is not None:
+            time_slices = age_buckets
+        if rank_errors is not None:
+            if isinstance(rank_errors, Mapping):
+                quantiles = {
+                    float(quantile): float(error)
+                    for quantile, error in rank_errors.items()
+                }
+            else:
+                rank_error = rank_errors
+        self._quantile_config = self._normalize_quantiles(
+            quantiles, rank_error)
+        self._max_age_seconds = max_age_seconds
+        self._time_slices = time_slices
+        self._clock = clock or time.time
+        self._window: Optional[TimeWindowQuantiles] = None
+        self._validate_window_options(max_age_seconds, time_slices)
+
+        if self._quantile_config and values.ValueClass._multiprocess:
+            raise ValueError(
+                'Summary quantiles are not supported in multi-process mode.')
+
+        super().__init__(
+            name,
+            documentation,
+            labelnames=labelnames,
+            namespace=namespace,
+            subsystem=subsystem,
+            unit=unit,
+            registry=registry,
+            _labelvalues=_labelvalues,
+        )
+        self._kwargs = {
+            'quantiles': quantiles,
+            'rank_error': rank_error,
+            'max_age_seconds': max_age_seconds,
+            'time_slices': time_slices,
+            'clock': clock,
+        }
+
+    @staticmethod
+    def _normalize_quantiles(
+        quantiles: Union[Sequence[float], Mapping[float, float], None],
+        rank_error: float,
+    ) -> Tuple[Tuple[float, float], ...]:
+        if not 0.0 < rank_error < 1.0:
+            raise ValueError('rank_error must be between 0 and 1.')
+        if quantiles is None:
+            return ()
+
+        if isinstance(quantiles, Mapping):
+            configured = tuple(quantiles.items())
+        else:
+            configured = tuple((quantile, rank_error)
+                              for quantile in quantiles)
+
+        normalized = []
+        for quantile, error in configured:
+            quantile = float(quantile)
+            error = float(error)
+            if not 0.0 <= quantile <= 1.0:
+                raise ValueError('Quantiles must be between 0 and 1.')
+            if not 0.0 < error < 1.0:
+                raise ValueError('rank_error must be between 0 and 1.')
+            normalized.append((quantile, error))
+
+        normalized.sort(key=lambda item: item[0])
+        if len({quantile for quantile, _ in normalized}) != len(normalized):
+            raise ValueError('Quantiles must be unique.')
+        return tuple(normalized)
+
+    @staticmethod
+    def _validate_window_options(max_age_seconds: float,
+                                time_slices: int) -> None:
+        if not math.isfinite(float(max_age_seconds)) or max_age_seconds <= 0:
+            raise ValueError('max_age_seconds must be a positive finite number.')
+        if not isinstance(time_slices, int) or time_slices <= 0:
+            raise ValueError('time_slices must be a positive integer.')
+
+    @property
+    def quantiles(self) -> Tuple[float, ...]:
+        return tuple(quantile for quantile, _ in self._quantile_config)
+
+    @property
+    def rank_errors(self) -> Mapping[float, float]:
+        return dict(self._quantile_config)
+
+    @property
+    def rank_error(self) -> Optional[float]:
+        if not self._quantile_config:
+            return None
+        return min(error for _, error in self._quantile_config)
+
+    @property
+    def max_age_seconds(self) -> float:
+        return self._max_age_seconds
+
+    @property
+    def time_slices(self) -> int:
+        return self._time_slices
+
+    @property
+    def effective_window_seconds(self) -> Tuple[float, float]:
+        if self._quantile_window is None:
+            return (0.0, 0.0)
+        return self._quantile_window.effective_window_seconds
+
+    @property
+    def max_expiration_error_seconds(self) -> float:
+        if self._quantile_window is None:
+            return self._max_age_seconds / self._time_slices
+        return self._quantile_window.max_expiration_error_seconds
+
+    @property
+    def effective_time_range_seconds(self) -> Tuple[float, float]:
+        return self.effective_window_seconds
+
+    @property
+    def age_buckets(self) -> int:
+        return self._time_slices
+
     def _metric_init(self) -> None:
         self._count = values.ValueClass(self._type, self._name, self._name + '_count', self._labelnames,
                                         self._labelvalues, self._documentation)
         self._sum = values.ValueClass(self._type, self._name, self._name + '_sum', self._labelnames, self._labelvalues, self._documentation)
         self._created = time.time()
+        self._quantile_window_lock = Lock()
+        self._quantile_window = None
+        if self._quantile_config:
+            self._quantile_window = TimeWindowQuantiles(
+                {quantile: error
+                 for quantile, error in self._quantile_config},
+                self._max_age_seconds,
+                self._time_slices,
+                self._clock,
+            )
 
     def observe(self, amount: float) -> None:
         """Observe the given amount.
@@ -554,6 +710,12 @@ class Summary(MetricWrapperBase):
         for details.
         """
         self._raise_if_not_observable()
+        amount = float(amount)
+        if not math.isfinite(amount):
+            raise ValueError('Observations must be finite.')
+        if self._quantile_window is not None:
+            with self._quantile_window_lock:
+                self._quantile_window.observe(amount)
         self._count.inc(1)
         self._sum.inc(amount)
 
@@ -565,7 +727,19 @@ class Summary(MetricWrapperBase):
         return Timer(self, 'observe')
 
     def _child_samples(self) -> Iterable[Sample]:
-        samples = [
+        quantile_samples: List[Sample] = []
+        quantile_window = getattr(self, '_quantile_window', None)
+        if quantile_window is not None:
+            with self._quantile_window_lock:
+                values_, _ = quantile_window.snapshot()
+            quantile_samples = [
+                Sample('', {'quantile': floatToGoString(quantile)}, value,
+                       None, None)
+                for quantile, value in zip(
+                    quantile_window.quantiles, values_)
+            ]
+
+        samples = quantile_samples + [
             Sample('_count', {}, self._count.get(), None, None),
             Sample('_sum', {}, self._sum.get(), None, None),
         ]

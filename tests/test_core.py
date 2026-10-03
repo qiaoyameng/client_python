@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import math
 import os
 import time
 import unittest
@@ -14,6 +15,7 @@ from prometheus_client.core import (
 )
 from prometheus_client.decorator import getargspec
 from prometheus_client.metrics import _get_use_created
+from prometheus_client.utils import floatToGoString
 from prometheus_client.validation import (
     disable_legacy_validation, enable_legacy_validation,
 )
@@ -305,6 +307,185 @@ class TestSummary(unittest.TestCase):
         self.summary.observe(10)
         self.assertEqual(1, self.registry.get_sample_value('s_count'))
         self.assertEqual(10, self.registry.get_sample_value('s_sum'))
+
+    def test_quantiles_small_sample_are_exact(self):
+        clock = metrics.time.monotonic
+        now = clock()
+        fake_clock = lambda: now
+        summary = Summary(
+            's_exact', 'help',
+            quantiles=(0.5, 0.9),
+            rank_error=0.02,
+            max_age_seconds=10.0,
+            time_slices=5,
+            clock=fake_clock,
+            registry=self.registry,
+        )
+        observations = [
+            -10.0, -2.0, -2.0, 0.0, 5.0, 8.0, 9.0, 9.0, 9.0, 100.0,
+        ]
+        for observation in observations:
+            summary.observe(observation)
+
+        self.assertEqual(5.0, self.registry.get_sample_value(
+            's_exact', {'quantile': floatToGoString(0.5)}))
+        self.assertEqual(9.0, self.registry.get_sample_value(
+            's_exact', {'quantile': floatToGoString(0.9)}))
+        self.assertEqual(len(observations),
+                         self.registry.get_sample_value('s_exact_count'))
+        self.assertEqual(sum(observations),
+                         self.registry.get_sample_value('s_exact_sum'))
+
+    def test_quantile_rank_error_with_permuted_observations(self):
+        clock_value = 0.0
+        clock = lambda: clock_value
+        summary = Summary(
+            's_rank', 'help', quantiles=(0.5,), rank_error=0.05,
+            max_age_seconds=10.0, time_slices=2, clock=clock,
+            registry=self.registry)
+        ordered = list(range(100))
+        observations = [
+            31, 7, 68, 0, 92, 14, 55, 3, 81, 42,
+            19, 76, 4, 59, 28, 97, 11, 47, 22, 88,
+            35, 63, 1, 73, 44, 16, 51, 8, 84, 38,
+            25, 66, 12, 58, 30, 94, 20, 49, 34, 79,
+            5, 70, 40, 15, 61, 24, 87, 33, 54, 9,
+            99, 45, 78, 2, 64, 37, 90, 18, 52, 27,
+            83, 41, 69, 6, 74, 48, 10, 95, 23, 56,
+            39, 85, 13, 60, 29, 91, 21, 46, 77, 32,
+            65, 17, 50, 86, 36, 71, 26, 53, 80, 43,
+            67, 57, 98, 72, 62, 82, 75, 89, 93, 96,
+        ]
+        self.assertEqual(ordered, sorted(observations))
+        for observation in observations:
+            summary.observe(observation)
+        value = self.registry.get_sample_value(
+            's_rank', {'quantile': '0.5'})
+        actual_rank = sum(1 for observation in ordered if observation <= value)
+        self.assertLessEqual(abs(actual_rank - 50), 0.05 * len(ordered))
+
+    def test_quantile_window_rotation_keeps_totals(self):
+        clock_value = 0.0
+        clock = lambda: clock_value
+        summary = Summary(
+            's_window', 'help',
+            quantiles=(0.5,),
+            rank_error=0.01,
+            max_age_seconds=10.0,
+            time_slices=5,
+            clock=clock,
+            registry=self.registry,
+        )
+
+        self.assertEqual(
+            (8.0, 10.0),
+            summary._quantile_window.effective_window_seconds)
+        self.assertEqual(
+            2.0, summary._quantile_window.max_expiration_error_seconds)
+
+        for value in range(10):
+            summary.observe(value)
+        clock_value = 11.0
+        self.assertTrue(math.isnan(self.registry.get_sample_value(
+            's_window', {'quantile': '0.5'})))
+        self.assertEqual(10.0, self.registry.get_sample_value('s_window_count'))
+        self.assertEqual(45.0, self.registry.get_sample_value('s_window_sum'))
+
+        clock_value = 20.0
+        for value in range(20, 30):
+            summary.observe(value)
+        self.assertEqual(24.0, self.registry.get_sample_value(
+            's_window', {'quantile': '0.5'}))
+        self.assertEqual(20.0, self.registry.get_sample_value('s_window_count'))
+        self.assertEqual(290.0, self.registry.get_sample_value('s_window_sum'))
+
+    def test_quantiles_cross_multiple_slices(self):
+        clock_value = 0.0
+        clock = lambda: clock_value
+        summary = Summary(
+            's_slices', 'help', quantiles=(0.5,),
+            max_age_seconds=4.0, time_slices=4, clock=clock,
+            registry=self.registry)
+        summary.observe(1.0)
+        summary.observe(2.0)
+        clock_value = 1.1
+        summary.observe(3.0)
+        summary.observe(4.0)
+        clock_value = 2.1
+        summary.observe(100.0)
+
+        self.assertEqual(3.0, self.registry.get_sample_value(
+            's_slices', {'quantile': '0.5'}))
+
+    def test_quantiles_reject_non_finite_input(self):
+        summary = Summary(
+            's_nonfinite', 'help', quantiles=(0.5,), clock=lambda: 0.0,
+            registry=self.registry)
+        for value in (float('nan'), float('inf'), float('-inf')):
+            with self.assertRaises(ValueError):
+                summary.observe(value)
+        self.assertEqual(0, self.registry.get_sample_value(
+            's_nonfinite_count'))
+
+    def test_quantiles_are_collected_from_one_snapshot(self):
+        clock_value = 0.0
+        clock = lambda: clock_value
+        summary = Summary(
+            's_snapshot', 'help', quantiles=(0.25, 0.75),
+            max_age_seconds=4.0, time_slices=4, clock=clock,
+            registry=self.registry)
+        summary.observe(1)
+        clock_value = 1.1
+        summary.observe(2)
+        summary.observe(3)
+        clock_value = 2.1
+        summary.observe(4)
+
+        metric = list(summary.collect())[0]
+        samples = [
+            sample for sample in metric.samples
+            if sample.labels.get('quantile') == '0.25']
+        self.assertEqual(1, len(samples))
+        self.assertEqual(1.0, samples[0].value)
+
+    def test_quantile_construction_validates_arguments(self):
+        with self.assertRaises(ValueError):
+            Summary('s_bad_q', 'help', quantiles=(-0.1,), registry=None)
+        with self.assertRaises(ValueError):
+            Summary('s_bad_e', 'help', rank_error=0.0, registry=None)
+        with self.assertRaises(ValueError):
+            Summary('s_bad_age', 'help', quantiles=(0.5,),
+                    max_age_seconds=0, registry=None)
+        with self.assertRaises(ValueError):
+            Summary('s_bad_slices', 'help', quantiles=(0.5,),
+                    time_slices=0, registry=None)
+
+    def test_quantile_window_is_concurrency_safe(self):
+        clock_value = 0.0
+        clock = lambda: clock_value
+        summary = Summary(
+            's_concurrent', 'help', quantiles=(0.5,),
+            max_age_seconds=100.0, time_slices=10, clock=clock,
+            registry=self.registry)
+
+        def observe(worker):
+            for value in range(200):
+                summary.observe(value + worker * 200)
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            for worker in range(8):
+                executor.submit(observe, worker)
+            quantiles = [
+                self.registry.get_sample_value(
+                    's_concurrent', {'quantile': '0.5'})
+                for _ in range(50)]
+
+        self.assertEqual(1600, self.registry.get_sample_value(
+            's_concurrent_count'))
+        quantile = self.registry.get_sample_value(
+            's_concurrent', {'quantile': '0.5'})
+        self.assertGreaterEqual(quantile, 700.0)
+        self.assertLessEqual(quantile, 900.0)
 
     def test_summary_not_observable(self):
         """.observe() must fail if the Summary is not observable."""
