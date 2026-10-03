@@ -105,3 +105,42 @@ Metrics exported:
 | `python_gc_collections_total` | Number of times each generation was collected. |
 
 The module-level `GC_COLLECTOR` is the default instance registered with `REGISTRY`.
+
+# Native Histogram Adapter Collector
+
+Some consumers only understand classic histograms. The
+`NativeHistogramClassicAdapter` wraps a source collector (or registry) that
+exposes native histograms and projects them onto caller-specified classic
+`le` bucket boundaries, preserving labels, `_count`, `_sum` and any
+`_created` timestamp. Metrics without native histogram samples pass through
+unchanged.
+
+```python
+from prometheus_client import CollectorRegistry, NativeHistogramClassicAdapter
+
+registry = CollectorRegistry()
+registry.register(NativeHistogramClassicAdapter(
+    source,
+    {'request_duration_seconds': [0.1, 0.5, 1, 2, 4]},
+))
+```
+
+In the default `exact` mode a boundary that cuts through a non-empty native
+histogram bucket raises `ValueError`, because the exact cumulative count is
+unknowable. With `mode='estimate'` such boundaries are additionally exposed
+as an interval estimate in a `<name>_bucket_estimate` gauge family, with a
+`bound` label of `lower` or `upper` bracketing the true count.
+
+## API Reference
+
+### NativeHistogramClassicAdapter
+
+```python
+NativeHistogramClassicAdapter(source, buckets, mode='exact')
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `source` | collector | (required) | Anything with a `collect()` method, e.g. another collector or a `CollectorRegistry`. |
+| `buckets` | `dict` or sequence | (required) | Either a mapping of metric family name to sorted, unique, finite `le` boundaries, or a single sequence of boundaries applied to every native histogram family. The `+Inf` bucket is added automatically. |
+| `mode` | `str` | `'exact'` | `'exact'` rejects boundaries cutting a native bucket; `'estimate'` emits a clearly labelled interval estimate for them instead. |
