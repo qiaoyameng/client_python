@@ -4,11 +4,20 @@ from .metrics_core import (
     HistogramMetricFamily, InfoMetricFamily, Metric, StateSetMetricFamily,
     SummaryMetricFamily, UnknownMetricFamily, UntypedMetricFamily,
 )
+from .native_histograms import (
+    ClassicBucketEstimate,
+    ClassicHistogramProjection,
+    NativeHistogramClassicCollector,
+    estimate_native_histogram_bounds,
+    project_native_histogram_bounds,
+)
 from .registry import CollectorRegistry, DuplicateTimeseries, REGISTRY
 from .samples import BucketSpan, Exemplar, NativeHistogram, Sample, Timestamp
 
 __all__ = (
     'BucketSpan',
+    'ClassicBucketEstimate',
+    'ClassicHistogramProjection',
     'CollectorRegistry',
     'Counter',
     'CounterMetricFamily',
@@ -24,6 +33,7 @@ __all__ = (
     'InfoMetricFamily',
     'Metric',
     'NativeHistogram',
+    'NativeHistogramClassicCollector',
     'REGISTRY',
     'Sample',
     'StateSetMetricFamily',
@@ -32,4 +42,6 @@ __all__ = (
     'Timestamp',
     'UnknownMetricFamily',
     'UntypedMetricFamily',
+    'estimate_native_histogram_bounds',
+    'project_native_histogram_bounds',
 )
