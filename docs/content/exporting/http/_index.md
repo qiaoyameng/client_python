@@ -73,3 +73,24 @@ sign and with a brief hint. Example:
 ```
 # HTTP 405 Method Not Allowed: XXX; use OPTIONS or GET
 ```
+
+# Exposition formats
+
+The exposition format is selected by content negotiation on the `Accept`
+header. The Prometheus text format (`text/plain; version=0.0.4`) is the
+compatible default. The OpenMetrics text format and the Prometheus protobuf
+format (`application/vnd.google.protobuf;
+proto=io.prometheus.client.MetricFamily; encoding=delimited`) are used when
+requested. A media type listed with `q=0` is never selected.
+
+The protobuf format covers counters, gauges, summaries, classic histograms
+and untyped metrics, preserving labels, timestamps and exemplars. Info,
+stateset and gaugehistogram metrics are degraded to their text-format
+equivalents (gauge/histogram), and native histograms are rejected. It can
+also be produced directly:
+
+```python
+from prometheus_client import protobuf
+
+output = protobuf.generate_latest()
+```

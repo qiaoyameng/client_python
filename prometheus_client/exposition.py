@@ -20,6 +20,7 @@ from urllib.request import (
 )
 from wsgiref.simple_server import make_server, WSGIRequestHandler, WSGIServer
 
+from . import protobuf
 from .openmetrics import exposition as openmetrics
 from .registry import Collector, REGISTRY
 from .utils import floatToGoString, parse_version
@@ -364,8 +365,13 @@ def choose_encoder(accept_header: str) -> Tuple[Callable[[Collector], bytes], st
     accept_header = accept_header or ''
     escaping = openmetrics.UNDERSCORES
     for accepted in accept_header.split(','):
-        if accepted.split(';')[0].strip() == 'application/openmetrics-text':
-            toks = accepted.split(';')
+        toks = accepted.split(';')
+        if _get_q(toks) == 0:
+            # A qvalue of zero means this media type is not acceptable.
+            continue
+        if toks[0].strip() == 'application/vnd.google.protobuf':
+            return protobuf.generate_latest, protobuf.CONTENT_TYPE_LATEST
+        elif toks[0].strip() == 'application/openmetrics-text':
             version = _get_version(toks)
             escaping = _get_escaping(toks)
             # Only return an escaping header if we have a good version and
@@ -375,8 +381,7 @@ def choose_encoder(accept_header: str) -> Tuple[Callable[[Collector], bytes], st
             if version and parse_version(version) >= (1, 0, 0):
                 return (partial(openmetrics.generate_latest, escaping=escaping, version=version),
                         f'application/openmetrics-text; version={version}; charset=utf-8; escaping=' + str(escaping))
-        elif accepted.split(';')[0].strip() == 'text/plain':
-            toks = accepted.split(';')
+        elif toks[0].strip() == 'text/plain':
             version = _get_version(toks)
             escaping = _get_escaping(toks)
             # Only return an escaping header if we have a good version and
@@ -385,6 +390,23 @@ def choose_encoder(accept_header: str) -> Tuple[Callable[[Collector], bytes], st
                 return (partial(generate_latest, escaping=escaping),
                         CONTENT_TYPE_LATEST + '; escaping=' + str(escaping))
     return generate_latest, CONTENT_TYPE_PLAIN_0_0_4
+
+
+def _get_q(accept_header: List[str]) -> float:
+    """Return the qvalue from the Accept header.
+
+    If no qvalue is specified or it cannot be parsed, returns 1."""
+
+    for tok in accept_header:
+        if '=' not in tok:
+            continue
+        key, value = tok.strip().split('=', 1)
+        if key == 'q':
+            try:
+                return float(value)
+            except ValueError:
+                return 1.0
+    return 1.0
 
 
 def _get_version(accept_header: List[str]) -> str:
